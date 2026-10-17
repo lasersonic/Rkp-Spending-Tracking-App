@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.env
+# credentials: never commit
+*client_secret*.json
+drive_token.json
+sa.json
+*-sa.json
+ChatExport_*/
