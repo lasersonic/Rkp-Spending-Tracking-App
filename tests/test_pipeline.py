@@ -51,6 +51,7 @@ def button_data(msg: OutMessage, label: str) -> str:
 def test_detect_type_and_pages():
     assert detect_type(JPEG) == ("image/jpeg", "jpg")
     assert detect_type(b"%PDF-1.7 ...") == ("application/pdf", "pdf")
+    assert detect_type(b"\x00\x00\x00\x18ftypheic....") == ("image/heic", "heic")
     assert detect_type(b"GIF89a") is None
     assert pdf_page_count(b"%PDF /Type /Pages /Type /Page x /Type/Page") == 2
 

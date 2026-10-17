@@ -32,6 +32,7 @@ LINE ──forward──▶ LINE OA ──webhook──▶ Cloud Run (FastAPI)
 | `app/dashboard.py` | Dashboard tab formulas |
 | `scripts/try_ocr.py` | M0: run your own receipts through iApp |
 | `scripts/setup.py` | M1: Drive token, Drive folder, Sheet tabs |
+| `scripts/check_setup.py` | Pre-flight check of every integration |
 | `scripts/backfill.py` | M4: import the Telegram archive |
 
 ## Bot commands
@@ -54,15 +55,15 @@ from that vendor is categorized automatically.
 
 ## Setup
 
-### M0: accuracy test
-Try 5–10 real receipts on iApp's "Try it" page, or with your API key:
+### M0: accuracy test (optional)
+The parser follows iApp's documented response layout (`processed` object,
+`itemName`/`itemUnitCost`/`itemTotalCost`). To check real receipts anyway:
 ```bash
 pip install -r requirements.txt
 IAPP_API_KEY=... python -m scripts.try_ocr receipt1.jpg receipt2.pdf
 ```
 It prints what the bot would log and saves each raw response as
-`<file>.iapp.json`. **Please share one of these JSON files**: the parser
-accepts several layouts, but it should be checked against iApp's real output.
+`<file>.iapp.json`. If a field comes out empty, share that JSON file.
 
 ### M1: accounts
 1. **LINE**: create a LINE Official Account and enable the Messaging API
@@ -141,6 +142,20 @@ Why these flags:
   duplicate checks can't race.
 - `--allow-unauthenticated`: LINE must reach the webhook. Requests are
   authenticated by the `X-Line-Signature` check and the user allowlist.
+
+### Check the setup
+Once the secrets exist, run the pre-flight check (locally, with the same env vars):
+```bash
+python -m scripts.check_setup                                   # config, LINE, iApp key, Sheet, Drive
+python -m scripts.check_setup --service-url https://<service>.run.app   # + deployed webhook
+python -m scripts.check_setup --ocr-sample receipt.jpg          # + one real OCR call (~1.34 ฿)
+```
+It checks: every setting is present and well-formed; the LINE token works, the
+OA is in Bot mode, the webhook URL ends in `/callback`, is switched on and
+passes LINE's test call; iApp accepts the key; the service account can open the
+Sheet and the tabs are right; the Drive folder is visible and a test file can be
+uploaded (catches the service-account storage problem); the deployed service is
+up and rejects unsigned requests.
 
 ### M4: Telegram backfill
 ```bash

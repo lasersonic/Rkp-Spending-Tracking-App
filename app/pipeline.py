@@ -63,6 +63,8 @@ def detect_type(content: bytes) -> tuple[str, str] | None:
         return "image/jpeg", "jpg"
     if content.startswith(b"\x89PNG\r\n\x1a\n"):
         return "image/png", "png"
+    if content[4:8] == b"ftyp" and content[8:12] in (b"heic", b"heix", b"mif1", b"msf1", b"heif"):
+        return "image/heic", "heic"  # iPhone photos sent as files
     return None
 
 
@@ -258,7 +260,7 @@ class Bot:
         received_at = received_at or self.now()
         kind = detect_type(content)
         if kind is None:
-            return Outcome("rejected", OutMessage("I can only read JPG/PNG photos and PDF files."))
+            return Outcome("rejected", OutMessage("I can only read JPG/PNG/HEIC photos and PDF files."))
         mime, ext = kind
 
         file_hash = hashlib.sha256(content).hexdigest()

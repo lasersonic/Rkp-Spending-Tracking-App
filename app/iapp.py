@@ -1,7 +1,7 @@
 """iApp Thai Receipt OCR v3: the API call (with retries) and response mapping.
 
-The exact JSON layout should be confirmed against real responses in M0.
-The parser is deliberately tolerant: a field may be a plain value or an
+Per iApp's docs the response is {"message", "processed": {...fields, "items": [...]}, "raw"},
+with item fields itemName / itemUnitCost / itemTotalCost. The parser is deliberately tolerant: a field may be a plain value or an
 object like {"value": ..., "confidence": ...}, the payload may be wrapped in
 "data"/"result", and multi-page PDFs may come back as a list of pages.
 """
@@ -89,7 +89,8 @@ def _unwrap(value: Any) -> tuple[Any, float | None]:
 
 
 def _payload(data: Any) -> Any:
-    for key in ("data", "result", "prediction", "predictions"):
+    # iApp v3 puts the extracted fields under "processed" (next to "raw" and "message").
+    for key in ("processed", "data", "result", "prediction", "predictions"):
         if isinstance(data, dict) and key in data and isinstance(data[key], (dict, list)):
             return _payload(data[key])
     return data
@@ -173,11 +174,11 @@ def parse_response(data: Any, today=None) -> ReceiptData:
             continue
         li = LineItem(
             item_no=n,
-            item_code=clean_text(_first(item, "itemCode", "code")),
+            item_code=clean_text(_first(item, "itemCode", "itemID", "code")),
             item_name=clean_text(_first(item, "itemName", "name", "description")),
-            qty=parse_number(_first(item, "quantity", "qty")),
-            unit_cost=parse_amount(_first(item, "unitCost", "unitPrice", "price")),
-            total_cost=parse_amount(_first(item, "totalCost", "amount", "total")),
+            qty=parse_number(_first(item, "itemQuantity", "itemQty", "itemAmount", "quantity", "qty")),
+            unit_cost=parse_amount(_first(item, "itemUnitCost", "unitCost", "unitPrice", "price")),
+            total_cost=parse_amount(_first(item, "itemTotalCost", "totalCost", "amount", "total")),
         )
         if li.item_name or li.total_cost is not None:
             r.items.append(li)

@@ -129,7 +129,7 @@ class FakeOcr:
 
 
 def iapp_response(**overrides):
-    """A plausible iApp v3 response with {value, confidence} fields."""
+    """An iApp v3 response in the documented layout, with {value, confidence} fields."""
     fields = {
         "invoiceType": "ใบกำกับภาษี/ใบเสร็จรับเงิน",
         "invoiceBook": "",
@@ -151,12 +151,13 @@ def iapp_response(**overrides):
     fields.update(overrides)
     data = {k: {"value": v, "confidence": 0.97} for k, v in fields.items()}
     data["items"] = [
-        {"itemName": {"value": "หมูสามชั้น", "confidence": 0.95}, "quantity": "2",
-         "unitCost": "300.00", "totalCost": "600.00"},
-        {"itemName": {"value": "ผักกาดขาว", "confidence": 0.93}, "quantity": "4",
-         "unitCost": "160.00", "totalCost": "640.00"},
+        {"itemName": {"value": "หมูสามชั้น", "confidence": 0.95}, "itemQuantity": "2",
+         "itemUnitCost": "300.00", "itemTotalCost": "600.00"},
+        {"itemName": {"value": "ผักกาดขาว", "confidence": 0.93}, "itemQuantity": "4",
+         "itemUnitCost": "160.00", "itemTotalCost": "640.00"},
     ]
-    return {"data": data}
+    # Layout from iApp's docs: fields under "processed", OCR extras under "raw".
+    return {"message": "success", "processed": data, "raw": {}}
 
 
 JPEG = b"\xff\xd8\xff\xe0" + b"fake-jpeg-body"
