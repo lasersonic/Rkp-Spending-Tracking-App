@@ -3,7 +3,7 @@ from decimal import Decimal
 
 from app.categorize import Vendor, find_vendor, normalize_vendor_name, short_name, DEFAULT_CATEGORIES
 from app.dashboard import BLOCKS
-from app.storage import col_letter, drive_file_id, to_cell
+from app.storage import RECEIPT_COLUMNS, col_letter, drive_file_id, to_cell
 
 
 def test_vendor_name_normalization_ignores_company_forms():
@@ -50,9 +50,12 @@ def test_drive_file_id():
 def test_dashboard_formulas_reference_the_right_columns():
     formulas = {title: f for _, title, f in BLOCKS}
     spend = formulas["Monthly spend by category (฿)"]
-    assert "Receipts!D2:D" in spend  # receipt_date
-    assert "Receipts!O2:O" in spend  # category
-    assert "Receipts!T2:T" in spend  # grand_total
+    def col(name):
+        letter = col_letter(RECEIPT_COLUMNS.index(name))
+        return f"Receipts!{letter}2:{letter}"
+
+    for name in ("receipt_date", "category", "grand_total"):
+        assert col(name) in spend
     vat = formulas["Input VAT by month (for ภ.พ.30)"]
-    assert "Receipts!U2:U" in vat and "Receipts!S2:S" in vat  # net_before_vat, vat
+    assert col("net_before_vat") in vat and col("vat") in vat
     assert all(f.startswith("=QUERY(") and f.count("(") == f.count(")") for f in formulas.values())

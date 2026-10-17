@@ -120,7 +120,8 @@ def parse_number(value: object) -> Decimal | None:
     amount = _to_decimal(value)
     if amount is None:
         return None
-    return amount.quantize(Decimal("0.001"), ROUND_HALF_UP).normalize()
+    n = amount.quantize(Decimal("0.001"), ROUND_HALF_UP).normalize()
+    return n.quantize(Decimal(1)) if n == n.to_integral_value() else n  # 10, not 1E+1
 
 
 def clean_text(value: object) -> str:

@@ -17,7 +17,7 @@ from datetime import date, datetime
 from decimal import Decimal
 from typing import Any, TypeVar
 
-from .categorize import Category, DEFAULT_CATEGORIES, Vendor
+from .categorize import Category, DEFAULT_CATEGORIES, Vendor, normalize_vendor_name
 
 log = logging.getLogger(__name__)
 
@@ -25,11 +25,8 @@ SHEETS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.file"]
 
 RECEIPT_COLUMNS = [
-    "receipt_id", "received_at", "submitted_by", "receipt_date", "doc_type",
-    "invoice_book", "invoice_no", "po_no", "vendor_name", "vendor_tax_id",
-    "vendor_phone", "vendor_address", "customer_name", "customer_tax_id",
-    "category", "subtotal", "discount", "after_discount", "vat", "grand_total",
-    "net_before_vat", "payment_method", "pages", "file_link", "file_hash",
+    "receipt_id", "received_at", "receipt_date", "invoice_no", "vendor_name", "category",
+    "subtotal", "discount", "after_discount", "vat", "grand_total", "net_before_vat", "payment_method", "pages", "file_link", "file_hash",
     "min_confidence", "review_status", "review_note", "source",
 ]
 LINE_ITEM_COLUMNS = [
@@ -225,13 +222,14 @@ class SheetStore:
                 return r["receipt_id"]
         return None
 
-    def invoice_exists(self, tax_id: str, invoice_no: str, exclude_id: str = "") -> str | None:
-        if not tax_id or not invoice_no:
+    def invoice_exists(self, vendor_name: str, invoice_no: str, exclude_id: str = "") -> str | None:
+        key = normalize_vendor_name(vendor_name)
+        if not key or not invoice_no:
             return None
         for r in self.receipts():
             if (
-                r.get("vendor_tax_id") == tax_id
-                and r.get("invoice_no") == invoice_no
+                r.get("invoice_no") == invoice_no
+                and normalize_vendor_name(r.get("vendor_name", "")) == key
                 and r["receipt_id"] != exclude_id
             ):
                 return r["receipt_id"]

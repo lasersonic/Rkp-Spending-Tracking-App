@@ -36,7 +36,7 @@ def test_import_dedupes_and_queues_vendor_categories(tmp_path, monkeypatch, caps
     out = capsys.readouterr().out
     assert "duplicate 1" in out and "logged 1" in out
     [row] = bot.sheets.rows
-    assert row["source"] == "telegram_backfill" and row["submitted_by"] == "telegram:Owner"
+    assert row["source"] == "telegram_backfill"
     assert row["received_at"] == "2026-03-02 09:15:00"
     [vendor] = bot.sheets.vendor_rows.values()
     assert vendor.category == ""

@@ -1,5 +1,7 @@
+import json
 from datetime import date
 from decimal import Decimal
+from pathlib import Path
 
 import httpx
 import pytest
@@ -114,3 +116,36 @@ def test_auth_errors_are_not_retried(monkeypatch, status):
     with pytest.raises(IappAuthError):
         client.ocr(b"x", "a.jpg", "image/jpeg")
     assert len(calls) == 1
+
+
+def test_live_v3_docs_layout():
+    """A real response from the live API: fields under docs[0].processed, with a
+    sibling confidence map that scores empty fields 0.0."""
+    data = json.loads((Path(__file__).parent / "data" / "iapp_v3_docs.json").read_text(encoding="utf-8"))
+    r = parse_response(data, TODAY)
+    assert r.vendor_name == "ร้านหมูอนามัย BETAGRO"
+    assert r.vendor_phone == "0639646397"
+    assert r.invoice_no == "INV2610170001"
+    assert r.receipt_date == date(2026, 10, 17)
+    assert r.grand_total == Decimal("100.00")
+    assert r.payment_method == "เงินโอนแบงค์ กรุงเทพ"
+    assert [(i.item_name, i.qty, i.total_cost) for i in r.items] == [("เต้าหู้ไข่อนามัย", Decimal("10"), Decimal("100.00"))]
+    assert str(r.items[0].qty) == "10"
+    # Empty fields (customer, VAT) and side fields (address 0.70) don't count.
+    assert r.min_confidence == 0.85
+    assert r.low_confidence_fields == []
+
+
+def test_live_v3_multi_page_docs():
+    page = {"processed": {"issuerName": "Makro", "items": [{"itemName": "A", "itemTotalCost": 10}]},
+            "confidence": {"issuerName": 0.9}}
+    last = {"processed": {"issuerName": "Makro", "grandTotal": 30, "items": [{"itemName": "B", "itemTotalCost": 20}]},
+            "confidence": {"issuerName": 0.9, "grandTotal": 0.95}}
+    r = parse_response({"docs": [page, last], "docs_count": 2}, TODAY)
+    assert r.grand_total == Decimal("30.00")
+    assert [i.item_name for i in r.items] == ["A", "B"]
+
+
+def test_empty_docs_raises():
+    with pytest.raises(IappError):
+        parse_response({"docs": [], "message": "no document found"}, TODAY)

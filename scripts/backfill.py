@@ -96,11 +96,13 @@ def cmd_import(args) -> int:
 
 def _remember_unknown_vendor(bot: Bot, receipt_id: str) -> None:
     r = bot.sheets.find_receipt(receipt_id)
-    if not r or (not r["vendor_tax_id"] and not r["vendor_name"]):
+    # The Receipts tab has no tax IDs, so new vendors are keyed by name; the
+    # bot fills in the tax ID the next time a receipt from them shows one.
+    if not r or not r["vendor_name"]:
         return
-    if find_vendor(bot.sheets.vendors(), r["vendor_tax_id"], r["vendor_name"]) is None:
+    if find_vendor(bot.sheets.vendors(), "", r["vendor_name"]) is None:
         bot.sheets.save_vendor(
-            Vendor(vendor_key(r["vendor_tax_id"], r["vendor_name"]), r["vendor_tax_id"], r["vendor_name"],
+            Vendor(vendor_key("", r["vendor_name"]), "", r["vendor_name"],
                    first_seen=bot.today().isoformat(), receipt_count=1)
         )
 
@@ -112,7 +114,7 @@ def cmd_apply_categories(args) -> int:
     for r in bot.sheets.receipts():
         if r["category"]:
             continue
-        v = find_vendor(vendors, r["vendor_tax_id"], r["vendor_name"])
+        v = find_vendor(vendors, "", r["vendor_name"])
         if v and v.category:
             bot.sheets.update_receipt(r["receipt_id"], {"category": v.category})
             bot.sheets.set_items_category(r["receipt_id"], v.category)

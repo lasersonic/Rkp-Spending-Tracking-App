@@ -1,0 +1,74 @@
+{
+  "docs": [
+    {
+      "message": "success",
+      "raw": {},
+      "processed": {
+        "invoiceType": "ใบเสร็จรับเงิน",
+        "invoiceBook": null,
+        "invoiceID": "INV2610170001",
+        "invoiceDate": "17/10/2026",
+        "purchaseOrderID": null,
+        "issuerName": "ร้านหมูอนามัย BETAGRO",
+        "issuerAddress": "Food Villa",
+        "issuerTaxID": null,
+        "issuerPhone": "0639646397",
+        "customerName": null,
+        "customerAddress": null,
+        "customerTaxID": null,
+        "customerPhone": null,
+        "items": [
+          {
+            "itemNo": null,
+            "itemCode": null,
+            "itemName": "เต้าหู้ไข่อนามัย",
+            "itemUnit": 10.0,
+            "itemUnitCost": null,
+            "itemTotalCost": 100.0,
+            "itemDiscount": null,
+            "itemNetAmount": 100.0
+          }
+        ],
+        "totalCost": 100.0,
+        "discount": null,
+        "discountDescription": null,
+        "discountPercentage": null,
+        "totalCostAfterDiscount": 100.0,
+        "vat": null,
+        "grandTotal": 100.0,
+        "totalAmountInWords": null,
+        "paymentMethod": "เงินโอนแบงค์ กรุงเทพ",
+        "paymentReference": null
+      },
+      "confidence": {
+        "invoiceType": 0.95,
+        "invoiceBook": 0.0,
+        "invoiceID": 0.9,
+        "invoiceDate": 0.85,
+        "purchaseOrderID": 0.0,
+        "issuerName": 0.95,
+        "issuerAddress": 0.7,
+        "issuerTaxID": 0.0,
+        "issuerPhone": 0.9,
+        "customerName": 0.0,
+        "customerAddress": 0.0,
+        "customerTaxID": 0.0,
+        "customerPhone": 0.0,
+        "items": 0.9,
+        "totalCost": 0.95,
+        "discount": 0.0,
+        "discountDescription": 0.0,
+        "discountPercentage": 0.0,
+        "totalCostAfterDiscount": 0.95,
+        "vat": 0.0,
+        "grandTotal": 0.95,
+        "totalAmountInWords": 0.0,
+        "paymentMethod": 0.85,
+        "paymentReference": 0.0
+      },
+      "process_ms": 9041
+    }
+  ],
+  "docs_count": 1,
+  "process_ms": 9041
+}

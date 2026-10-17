@@ -9,6 +9,7 @@ object like {"value": ..., "confidence": ...}, the payload may be wrapped in
 from __future__ import annotations
 
 import logging
+import re
 import time
 from typing import Any
 
@@ -77,6 +78,13 @@ class IappClient:
 
 _VALUE_KEYS = ("value", "text", "result")
 _CONF_KEYS = ("confidence", "conf", "score")
+# Only fields that feed amounts, dates or vendor matching count towards
+# min_confidence; a shaky address or payment method shouldn't flag a receipt.
+_KEY_FIELDS = {
+    "invoiceDate", "date", "invoiceID", "invoiceId", "invoiceNo", "issuerName",
+    "issuerTaxID", "issuerTaxId", "totalCost", "discount", "totalCostAfterDiscount",
+    "vat", "grandTotal", "items",
+}
 
 
 def _unwrap(value: Any) -> tuple[Any, float | None]:
@@ -86,6 +94,29 @@ def _unwrap(value: Any) -> tuple[Any, float | None]:
         raw = next((value[k] for k in _VALUE_KEYS if k in value), None)
         return raw, (float(conf) if conf is not None else None)
     return value, None
+
+
+def _from_docs(data: Any) -> Any:
+    """The live v3 API wraps results as {"docs": [{"processed": {...}, "confidence": {...}}]},
+    one doc per page. Turn that into plain pages, each carrying its own confidence map.
+    Fields iApp left empty come with confidence 0.0; those are dropped so a blank
+    customer name doesn't flag every receipt as low confidence."""
+    if not (isinstance(data, dict) and isinstance(data.get("docs"), list)):
+        return data
+    pages = []
+    for doc in data["docs"]:
+        if not isinstance(doc, dict) or not isinstance(doc.get("processed"), dict):
+            continue
+        page = dict(doc["processed"])
+        conf = doc.get("confidence")
+        if isinstance(conf, dict):
+            page["confidence"] = {
+                k: c for k, c in conf.items() if _unwrap(page.get(k))[0] not in (None, "", [])
+            }
+        pages.append(page)
+    if not pages:
+        raise IappError(f"iApp returned no results: {data.get('message') or 'empty docs'}")
+    return pages[0] if len(pages) == 1 else pages
 
 
 def _payload(data: Any) -> Any:
@@ -138,7 +169,7 @@ def _first(d: dict, *keys: str) -> Any:
 
 
 def parse_response(data: Any, today=None) -> ReceiptData:
-    payload = _payload(data)
+    payload = _payload(_from_docs(data))
     if isinstance(payload, list):
         payload = _merge_pages(payload)
     if not isinstance(payload, dict):
@@ -176,14 +207,14 @@ def parse_response(data: Any, today=None) -> ReceiptData:
             item_no=n,
             item_code=clean_text(_first(item, "itemCode", "itemID", "code")),
             item_name=clean_text(_first(item, "itemName", "name", "description")),
-            qty=parse_number(_first(item, "itemQuantity", "itemQty", "itemAmount", "quantity", "qty")),
+            qty=parse_number(_first(item, "itemQuantity", "itemQty", "itemAmount", "quantity", "qty", "itemUnit")),
             unit_cost=parse_amount(_first(item, "itemUnitCost", "unitCost", "unitPrice", "price")),
             total_cost=parse_amount(_first(item, "itemTotalCost", "totalCost", "amount", "total")),
         )
         if li.item_name or li.total_cost is not None:
             r.items.append(li)
 
-    confs = _confidences(payload)
+    confs = [(name, c) for name, c in _confidences(payload) if re.split(r"[.\[]", name)[0] in _KEY_FIELDS]
     if confs and max(c for _, c in confs) > 1:  # reported as a percentage
         confs = [(name, c / 100) for name, c in confs]
     if confs:

@@ -103,15 +103,15 @@ def test_ensure_schema_creates_tabs_and_is_idempotent():
 def test_receipt_round_trip():
     store, ss = make_store()
     store.add_receipt(
-        {"receipt_id": "R1", "received_at": datetime(2026, 10, 17, 9, 0), "vendor_tax_id": "0107537000521",
+        {"receipt_id": "R1", "received_at": datetime(2026, 10, 17, 9, 0), "vendor_name": "Makro",
          "invoice_no": "00123", "grand_total": Decimal("1240.00"), "file_hash": "abc", "category": ""},
         [{"receipt_id": "R1", "item_no": 1, "item_name": "หมู", "total_cost": Decimal("600")},
          {"receipt_id": "R1", "item_no": 2, "item_name": "ผัก", "total_cost": Decimal("640")}],
     )
     assert store.hash_exists("abc") == "R1"
     assert store.hash_exists("zzz") is None
-    assert store.invoice_exists("0107537000521", "00123") == "R1"  # leading zeros kept
-    assert store.invoice_exists("0107537000521", "00123", exclude_id="R1") is None
+    assert store.invoice_exists(" makro ", "00123") == "R1"  # leading zeros kept
+    assert store.invoice_exists("Makro", "00123", exclude_id="R1") is None
 
     assert store.update_receipt("R1", {"category": "FOOD", "review_status": "confirmed"})
     store.set_items_category("R1", "FOOD")

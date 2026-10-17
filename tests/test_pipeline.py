@@ -2,6 +2,7 @@ from urllib.parse import parse_qs
 
 from linebot.v3.webhooks import MessageEvent, PostbackEvent
 
+from app.categorize import Vendor
 from app.config import Settings
 from app.iapp import IappAuthError, IappError
 from app.line_client import OutMessage
@@ -80,10 +81,13 @@ def test_new_vendor_receipt_is_archived_logged_and_asks_for_category():
     assert row["grand_total"] == "1,240.00"
     assert row["vat"] == "81.12"
     assert row["net_before_vat"] == "1,158.88"
-    assert row["vendor_tax_id"] == "0107537000521"
+    assert row["vendor_name"].startswith("บริษัท สยามแม็คโคร")
+    for dropped in ("vendor_tax_id", "vendor_phone", "vendor_address", "customer_name", "customer_tax_id",
+                    "submitted_by", "doc_type", "invoice_book", "po_no"):
+        assert dropped not in row
     assert row["category"] == ""
     assert row["review_status"] == "ok"
-    assert row["source"] == "line" and row["submitted_by"] == STAFF
+    assert row["source"] == "line"
     assert len(bot.sheets.items) == 2
 
     [f] = bot.drive.files.values()
@@ -162,6 +166,15 @@ def test_same_invoice_different_photo_is_skipped():
     assert len(bot.sheets.rows) == 1
     assert [f["trashed"] for f in bot.drive.files.values()] == [False, True]
     assert "already logged" in last_reply(line).text
+
+
+def test_vendor_without_tax_id_learns_it():
+    bot, line = make_bot()
+    bot.sheets.save_vendor(Vendor("name:makro", "", "บริษัท สยามแม็คโคร จำกัด (มหาชน)", category="FOOD"))
+    bot.handle(image_event())
+    [v] = bot.sheets.vendors()
+    assert v.tax_id == "0107537000521" and v.receipt_count == 1
+    assert bot.sheets.rows[0]["category"] == "FOOD"
 
 
 def test_out_of_credits_keeps_file_and_alerts_owner_then_retry_works():

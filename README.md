@@ -17,7 +17,7 @@ Spec: v1.0, 17 Oct 2026. Cost: about 100–150 ฿/month at 60–80 receipts.
 LINE ──forward──▶ LINE OA ──webhook──▶ Cloud Run (FastAPI)
                                          │
        download ─▶ dedupe (SHA-256) ─▶ Drive /Receipts/YYYY/MM/ ─▶ iApp OCR
-       ─▶ normalize (BE→CE dates, amounts) ─▶ validate ─▶ dedupe (tax ID + invoice no.)
+       ─▶ normalize (BE→CE dates, amounts) ─▶ validate ─▶ dedupe (vendor + invoice no.)
        ─▶ categorize (vendor memory) ─▶ rename in Drive ─▶ Sheets rows ─▶ LINE reply
 ```
 

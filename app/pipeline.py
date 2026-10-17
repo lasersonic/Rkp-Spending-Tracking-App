@@ -289,7 +289,6 @@ class Bot:
         record: dict[str, Any] = {
             "receipt_id": receipt_id,
             "received_at": received_at,
-            "submitted_by": submitted_by,
             "pages": pages,
             "file_link": link,
             "file_hash": file_hash,
@@ -321,7 +320,7 @@ class Bot:
             )
 
         r = result.data
-        dup = self.sheets.invoice_exists(r.vendor_tax_id, r.invoice_no)
+        dup = self.sheets.invoice_exists(r.vendor_name, r.invoice_no)
         if dup:
             self._safe(lambda: self.drive.trash(file_id), "trash duplicate", receipt_id)
             return Outcome(
@@ -355,7 +354,15 @@ class Bot:
             vendor.receipt_count += 1
             if r.vendor_name and r.vendor_name != vendor.name and r.vendor_name not in vendor.aliases:
                 vendor.aliases.append(r.vendor_name)
+            if r.vendor_tax_id and not vendor.tax_id:
+                vendor.tax_id = r.vendor_tax_id
             self._safe(lambda: self.sheets.save_vendor(vendor), "update vendor", receipt_id)
+        elif r.vendor_name or r.vendor_tax_id:
+            # Save new vendors now, while the tax ID is at hand: the Receipts tab
+            # doesn't keep it, so the category button can only find them by name.
+            new = Vendor(vendor_key(r.vendor_tax_id, r.vendor_name), r.vendor_tax_id, r.vendor_name,
+                         first_seen=self.today().isoformat(), receipt_count=1)
+            self._safe(lambda: self.sheets.save_vendor(new), "save vendor", receipt_id)
 
         received = record["received_at"].date()
         # A misread date (e.g. year 2099) shouldn't create a stray folder.
@@ -366,16 +373,8 @@ class Bot:
 
         record.update(
             receipt_date=r.receipt_date,
-            doc_type=r.doc_type,
-            invoice_book=r.invoice_book,
             invoice_no=r.invoice_no,
-            po_no=r.po_no,
             vendor_name=r.vendor_name,
-            vendor_tax_id=r.vendor_tax_id,
-            vendor_phone=r.vendor_phone,
-            vendor_address=r.vendor_address,
-            customer_name=r.customer_name,
-            customer_tax_id=r.customer_tax_id,
             category=category,
             subtotal=r.subtotal,
             discount=r.discount,
@@ -412,7 +411,7 @@ class Bot:
         d = record.get("receipt_date")
         parts = [
             fmt_baht(record.get("grand_total")),
-            record.get("vendor_name") or record.get("vendor_tax_id") or "Unknown vendor",
+            record.get("vendor_name") or "Unknown vendor",
             self._category_name(record["category"]) if record.get("category") else "❓ category",
             f"{d:%d/%m}" if d else "no date",
         ]
@@ -480,7 +479,7 @@ class Bot:
             self.sheets.update_receipt(rid, {"review_note": result.error})
             return False
         r = result.data
-        dup = self.sheets.invoice_exists(r.vendor_tax_id, r.invoice_no, exclude_id=rid)
+        dup = self.sheets.invoice_exists(r.vendor_name, r.invoice_no, exclude_id=rid)
         if dup:
             result.problems.append(f"possible duplicate of {dup}")
         kind = detect_type(content)

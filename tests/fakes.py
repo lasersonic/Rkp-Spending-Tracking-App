@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import date, datetime
 from decimal import Decimal
 
-from app.categorize import DEFAULT_CATEGORIES, Vendor
+from app.categorize import DEFAULT_CATEGORIES, Vendor, normalize_vendor_name
 from app.storage import RECEIPT_COLUMNS, to_cell
 
 
@@ -35,12 +35,14 @@ class FakeSheets:
     def hash_exists(self, h):
         return next((r["receipt_id"] for r in self.rows if r["file_hash"] == h), None)
 
-    def invoice_exists(self, tax_id, invoice_no, exclude_id=""):
-        if not tax_id or not invoice_no:
+    def invoice_exists(self, vendor_name, invoice_no, exclude_id=""):
+        key = normalize_vendor_name(vendor_name)
+        if not key or not invoice_no:
             return None
         return next(
             (r["receipt_id"] for r in self.rows
-             if r["vendor_tax_id"] == tax_id and r["invoice_no"] == invoice_no and r["receipt_id"] != exclude_id),
+             if normalize_vendor_name(r["vendor_name"]) == key and r["invoice_no"] == invoice_no
+             and r["receipt_id"] != exclude_id),
             None,
         )
 
