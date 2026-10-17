@@ -90,6 +90,18 @@ def postback(action: str, receipt_id: str, **extra: str) -> str:
     return urlencode({"a": action, "r": receipt_id, **extra})
 
 
+def vendor_ref(vendor: Vendor) -> str:
+    """Short, stable id for a vendor in postback data (Thai keys get long once URL-encoded)."""
+    return hashlib.sha1(vendor.vendor_key.encode("utf-8")).hexdigest()[:10]
+
+
+def vendor_label(name: str) -> str:
+    """LINE chip labels max 20 chars: drop the "ร้าน" (shop) prefix before cutting."""
+    if len(name) > 20 and name.startswith("ร้าน"):
+        name = name[len("ร้าน"):].strip()
+    return name[:20]
+
+
 @dataclass
 class Outcome:
     status: str  # logged | duplicate | pending | rejected | error
@@ -142,6 +154,14 @@ class Bot:
         return tuple(
             Button(short_name(c), postback("cat", receipt_id, c=c.code)) for c in self._categories()[:13]
         )
+
+    def _vendor_buttons(self, receipt_id: str) -> tuple[Button, ...]:
+        """Known vendors from the Vendors tab, most used first."""
+        vendors = sorted(
+            (v for v in self.sheets.vendors() if v.name),
+            key=lambda v: (-v.receipt_count, v.name),
+        )
+        return tuple(Button(vendor_label(v.name), postback("ven", receipt_id, v=vendor_ref(v))) for v in vendors[:13])
 
     def _category_name(self, code: str) -> str:
         for c in self._categories():
@@ -232,7 +252,47 @@ class Bot:
             self.set_category(receipt, code)
             vendor = receipt.get("vendor_name") or "this vendor"
             return OutMessage(f"✅ {vendor} → {self._category_name(code)}. I'll remember this vendor.")
+        if action == "ven":
+            return self.set_vendor(receipt, q.get("v", ""))
         return OutMessage(HELP_TEXT)
+
+    def set_vendor(self, receipt: dict[str, str], ref: str) -> OutMessage:
+        """The OCR found no vendor and the user picked one from the list."""
+        rid = receipt["receipt_id"]
+        vendor = next((v for v in self.sheets.vendors() if vendor_ref(v) == ref), None)
+        if vendor is None:
+            return OutMessage("I couldn't find that vendor on the Vendors tab any more.")
+        problems = [p for p in receipt.get("review_note", "").split("; ") if p and p != "missing vendor"]
+        fields: dict[str, Any] = {"vendor_name": vendor.name, "review_note": "; ".join(problems)}
+        if receipt.get("review_status") == STATUS_REVIEW and not problems:
+            fields["review_status"] = STATUS_OK
+        if vendor.category:
+            fields["category"] = vendor.category
+            self.sheets.set_items_category(rid, vendor.category)
+        self.sheets.update_receipt(rid, fields)
+        vendor.receipt_count += 1
+        self.sheets.save_vendor(vendor)
+        self._rename_in_drive(receipt, vendor.name)
+
+        if vendor.category:
+            return OutMessage(f"✅ {vendor.name} · {self._category_name(vendor.category)}. Saved.")
+        return OutMessage(f"✅ {vendor.name}. Now pick a category:", quick_replies=self._category_buttons(rid))
+
+    def _rename_in_drive(self, receipt: dict[str, str], vendor_name: str) -> None:
+        """Same name pattern as _finish, now that the vendor is known."""
+        file_id = drive_file_id(receipt.get("file_link", ""))
+        if not file_id:
+            return
+        today = self.today()
+        folder_date = parse_date(receipt.get("receipt_date"), today) or parse_date(receipt.get("received_at"), today) or today
+        total = parse_amount(receipt.get("grand_total")) or 0
+
+        def rename() -> None:
+            ext = self.drive.name(file_id).rsplit(".", 1)[-1]
+            name = f"{folder_date.isoformat()}_{file_slug(vendor_name)}_{total}.{ext}"
+            self.drive.rename_and_move(file_id, name, folder_date)
+
+        self._safe(rename, "rename in Drive", receipt["receipt_id"])
 
     def set_category(self, receipt: dict[str, str], code: str) -> None:
         rid = receipt["receipt_id"]
@@ -416,7 +476,10 @@ class Bot:
             f"{d:%d/%m}" if d else "no date",
         ]
         line = " · ".join(parts) + (" ⚠️" if problems else " ✅")
-        if not record.get("category"):
+        vendor_chips = () if record.get("vendor_name") else self._vendor_buttons(rid)
+        if vendor_chips:
+            line += "\nWhich shop is this? Pick below."
+        elif not record.get("category"):
             line += "\nNew vendor: pick a category below."
         if problems:
             line += "\nCheck: " + "; ".join(problems)
@@ -425,6 +488,8 @@ class Bot:
             Button("Change category", postback("chcat", rid)),
             Button("Flag", postback("flag", rid)),
         )
+        if vendor_chips:
+            return OutMessage(line, buttons=buttons, quick_replies=vendor_chips)
         if not record.get("category"):
             return OutMessage(line, buttons=buttons, quick_replies=self._category_buttons(rid))
         return OutMessage(line, buttons=buttons)

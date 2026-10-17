@@ -94,6 +94,9 @@ class FakeDrive:
     def rename_and_move(self, fid, name, folder_date):
         self.files[fid].update(name=name, folder=f"{folder_date:%Y/%m}")
 
+    def name(self, fid):
+        return self.files[fid]["name"]
+
     def trash(self, fid):
         self.files[fid]["trashed"] = True
 

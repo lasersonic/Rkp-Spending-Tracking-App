@@ -2,7 +2,7 @@ from urllib.parse import parse_qs
 
 from linebot.v3.webhooks import MessageEvent, PostbackEvent
 
-from app.categorize import Vendor
+from app.categorize import Vendor, vendor_key
 from app.config import Settings
 from app.iapp import IappAuthError, IappError
 from app.line_client import OutMessage
@@ -274,3 +274,48 @@ def test_postback_payload_fits_line_limit():
     for b in last_reply(line).buttons + last_reply(line).quick_replies:
         assert len(b.data) <= 300 and len(b.label) <= 20
         assert parse_qs(b.data)["r"] == [bot.sheets.rows[0]["receipt_id"]]
+
+
+SHOPS = ["ร้านผักสมบัติโน๊ต", "ร้านไข่นายร้อย", "ร้านหมูอนามัย BETAGRO", "ร้านหมูเจ๊จิ๋ว", "ร้านกาญ กุ้งสด"]
+
+
+def bot_with_shops():
+    bot, line = make_bot(ocr=FakeOcr(iapp_response(issuerName="", issuerTaxID="")))
+    for name in SHOPS:
+        bot.sheets.save_vendor(Vendor(vendor_key("", name), "", name, category="FOOD" if "BETAGRO" in name else ""))
+    return bot, line
+
+
+def test_unknown_vendor_asks_which_shop():
+    bot, line = bot_with_shops()
+    bot.handle(image_event())
+    msg = last_reply(line)
+    assert "Which shop is this?" in msg.text
+    labels = [b.label for b in msg.quick_replies]
+    assert "หมูอนามัย BETAGRO" in labels and "ร้านผักสมบัติโน๊ต" in labels and len(labels) == 5
+    assert all(len(b.label) <= 20 and len(b.data) <= 300 for b in msg.quick_replies)
+    assert bot.sheets.rows[0]["review_status"] == "needs_review"
+
+
+def test_picking_a_shop_with_a_category_fills_the_row():
+    bot, line = bot_with_shops()
+    bot.handle(image_event())
+    bot.handle(postback_event(button_data(last_reply(line), "หมูอนามัย BETAGRO")))
+    row = bot.sheets.rows[0]
+    assert row["vendor_name"] == "ร้านหมูอนามัย BETAGRO" and row["category"] == "FOOD"
+    assert row["review_status"] == "ok" and row["review_note"] == ""
+    assert {i["category"] for i in bot.sheets.items} == {"FOOD"}
+    [f] = bot.drive.files.values()
+    assert f["name"].startswith("2026-10-15_ร้านหมูอนามัย-BETAGRO_") and f["name"].endswith(".jpg")
+    assert "✅ ร้านหมูอนามัย BETAGRO" in last_reply(line).text
+    assert next(v for v in bot.sheets.vendors() if "BETAGRO" in v.name).receipt_count == 1
+
+
+def test_picking_a_shop_without_a_category_then_asks_for_one():
+    bot, line = bot_with_shops()
+    bot.handle(image_event())
+    bot.handle(postback_event(button_data(last_reply(line), "ร้านไข่นายร้อย")))
+    assert "pick a category" in last_reply(line).text
+    bot.handle(postback_event(button_data(last_reply(line), "Food cost")))
+    assert bot.sheets.rows[0]["category"] == "FOOD"
+    assert next(v for v in bot.sheets.vendors() if v.name == "ร้านไข่นายร้อย").category == "FOOD"

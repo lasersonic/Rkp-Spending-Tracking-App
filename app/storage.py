@@ -394,6 +394,13 @@ class DriveStore:
             "rename Drive file",
         )
 
+    def name(self, file_id: str) -> str:
+        meta = with_retry(
+            lambda: self.svc.files().get(fileId=file_id, fields="name", supportsAllDrives=True).execute(),
+            "read Drive file",
+        )
+        return meta.get("name", "")
+
     def trash(self, file_id: str) -> None:
         with_retry(
             lambda: self.svc.files().update(
