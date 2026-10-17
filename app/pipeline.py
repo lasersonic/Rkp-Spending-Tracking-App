@@ -26,7 +26,7 @@ from linebot.v3.webhooks import (
     TextMessageContent,
 )
 
-from .categorize import Category, Vendor, find_vendor, short_name, vendor_key
+from .categorize import Category, Vendor, find_vendor, normalize_vendor_name, short_name, vendor_key
 from .config import Settings
 from .iapp import MAX_BYTES, MAX_PDF_PAGES, IappAuthError, IappError, parse_response
 from .line_client import Button, OutMessage
@@ -47,6 +47,7 @@ HELP_TEXT = (
 )
 
 CATEGORY_CACHE_SECONDS = 300
+PRICE_WAIT_SECONDS = 600
 
 STATUS_OK = "ok"
 STATUS_REVIEW = "needs_review"
@@ -90,9 +91,19 @@ def postback(action: str, receipt_id: str, **extra: str) -> str:
     return urlencode({"a": action, "r": receipt_id, **extra})
 
 
-def vendor_ref(vendor: Vendor) -> str:
-    """Short, stable id for a vendor in postback data (Thai keys get long once URL-encoded)."""
-    return hashlib.sha1(vendor.vendor_key.encode("utf-8")).hexdigest()[:10]
+def supplier_ref(name: str) -> str:
+    """Short, stable id for a supplier in postback data (Thai names get long once URL-encoded)."""
+    return hashlib.sha1(name.encode("utf-8")).hexdigest()[:10]
+
+
+_PRICE_RE = re.compile(r"^(?:฿|thb)?\s*([\d๐-๙][\d๐-๙,]*(?:\.\d{1,2})?)\s*(?:บาท|baht|thb|฿)?$", re.IGNORECASE)
+
+
+def parse_typed_price(text: str) -> Decimal | None:
+    """'1250', '1,250.50', '฿1250', '๑๒๕๐ บาท' -> Decimal. Anything else (dates, words) -> None."""
+    m = _PRICE_RE.match(text.strip())
+    amount = parse_amount(m.group(1)) if m else None
+    return amount if amount is not None and amount > 0 else None
 
 
 def vendor_label(name: str) -> str:
@@ -126,6 +137,9 @@ class Bot:
         self.ocr = ocr
         self._now = now or (lambda: datetime.now(settings.tz))
         self._cat_cache: tuple[float, list[Category]] | None = None
+        # (user, chat) -> (receipt_id, deadline) after "Change price". In memory: fine
+        # with one instance; a restart only means tapping the button again.
+        self._price_waits: dict[tuple[str, str], tuple[str, float]] = {}
 
     # -- helpers ----------------------------------------------------------------
 
@@ -155,13 +169,12 @@ class Bot:
             Button(short_name(c), postback("cat", receipt_id, c=c.code)) for c in self._categories()[:13]
         )
 
-    def _vendor_buttons(self, receipt_id: str) -> tuple[Button, ...]:
-        """Known vendors from the Vendors tab, most used first."""
-        vendors = sorted(
-            (v for v in self.sheets.vendors() if v.name),
-            key=lambda v: (-v.receipt_count, v.name),
+    def _supplier_buttons(self, receipt_id: str) -> tuple[Button, ...]:
+        """The fixed list on the Suppliers tab, in sheet order."""
+        return tuple(
+            Button(vendor_label(name), postback("ven", receipt_id, v=supplier_ref(name)))
+            for name in self.sheets.suppliers()[:13]
         )
-        return tuple(Button(vendor_label(v.name), postback("ven", receipt_id, v=vendor_ref(v))) for v in vendors[:13])
 
     def _category_name(self, code: str) -> str:
         for c in self._categories():
@@ -189,11 +202,11 @@ class Bot:
 
         try:
             if isinstance(event, PostbackEvent):
-                msg = self.handle_postback(event.postback.data)
+                msg = self.handle_postback(event.postback.data, user_id, to)
             elif isinstance(event.message, (ImageMessageContent, FileMessageContent)):
                 msg = self.handle_file_message(event.message, user_id, to)
             elif isinstance(event.message, TextMessageContent):
-                msg = self.handle_text(event.message.text)
+                msg = self.handle_text(event.message.text, user_id, to)
             else:
                 msg = None  # stickers, locations, etc.
         except Exception as exc:
@@ -216,8 +229,9 @@ class Bot:
         content = self.line.download(message.id)
         return self.process_file(content, filename, submitted_by=user_id, source="line").message
 
-    def handle_text(self, text: str) -> OutMessage | None:
-        """Only exact commands get an answer; any other chat is ignored."""
+    def handle_text(self, text: str, user_id: str = "", to: str = "") -> OutMessage | None:
+        """Only exact commands get an answer, plus the reply to "Change price";
+        any other chat is ignored."""
         t = text.strip().lower()
         if t in {"summary", "/summary"}:
             return self.month_summary()
@@ -225,15 +239,69 @@ class Bot:
             return self.retry_pending()
         if t in {"help", "/help"}:
             return OutMessage(HELP_TEXT)
+        rid = self._waiting_price(user_id, to)
+        if rid:
+            return self.handle_price_reply(rid, text, user_id, to)
         return None
 
-    def handle_postback(self, data: str) -> OutMessage:
+    # -- "Change price": the next message from the same person in the same chat
+
+    def _waiting_price(self, user_id: str, to: str) -> str:
+        entry = self._price_waits.get((user_id, to))
+        if entry and entry[1] > time.monotonic():
+            return entry[0]
+        self._price_waits.pop((user_id, to), None)
+        return ""
+
+    def ask_price(self, receipt: dict[str, str], user_id: str, to: str) -> OutMessage:
+        self._price_waits[(user_id, to)] = (receipt["receipt_id"], time.monotonic() + PRICE_WAIT_SECONDS)
+        current = parse_amount(receipt.get("grand_total"))
+        vendor = receipt.get("vendor_name") or receipt["receipt_id"]
+        now = f"now {fmt_baht(current)}" if current is not None else "no total yet"
+        return OutMessage(f'Type the correct total for {vendor} ({now}).\nSend "cancel" to stop.')
+
+    def handle_price_reply(self, rid: str, text: str, user_id: str, to: str) -> OutMessage:
+        if text.strip().lower() in {"cancel", "ยกเลิก"}:
+            self._price_waits.pop((user_id, to), None)
+            return OutMessage("OK, the total wasn't changed.")
+        amount = parse_typed_price(text)
+        if amount is None:
+            return OutMessage('That isn\'t a price. Type a number like 1250, or "cancel".')
+        self._price_waits.pop((user_id, to), None)
+        receipt = self.sheets.find_receipt(rid)
+        if receipt is None:
+            return OutMessage("I couldn't find that receipt any more.")
+        return self.set_price(receipt, amount)
+
+    def set_price(self, receipt: dict[str, str], amount: Decimal) -> OutMessage:
+        rid = receipt["receipt_id"]
+        old = parse_amount(receipt.get("grand_total"))
+        vat = parse_amount(receipt.get("vat")) or Decimal(0)
+        # Warnings about the total no longer apply once a person has typed it.
+        problems = [
+            p for p in receipt.get("review_note", "").split("; ")
+            if p and not p.startswith(("missing grand total", "VAT ", "total edited by hand"))
+        ]
+        fields: dict[str, Any] = {
+            "grand_total": amount,
+            "net_before_vat": amount - vat,
+            "review_note": "; ".join(problems + [f"total edited by hand (was {fmt_baht(old)})"]),
+        }
+        if receipt.get("review_status") == STATUS_REVIEW and not problems:
+            fields["review_status"] = STATUS_OK
+        self.sheets.update_receipt(rid, fields)
+        self._rename_in_drive({**receipt, "grand_total": str(amount)}, receipt.get("vendor_name") or "unknown")
+        vendor = receipt.get("vendor_name") or rid
+        return OutMessage(f"✅ {vendor}: total changed from {fmt_baht(old)} to {fmt_baht(amount)}.")
+
+    def handle_postback(self, data: str, user_id: str = "", to: str = "") -> OutMessage:
         q = {k: v[0] for k, v in parse_qs(data).items()}
         action, rid = q.get("a", ""), q.get("r", "")
         receipt = self.sheets.find_receipt(rid) if rid else None
         if receipt is None:
             return OutMessage("I couldn't find that receipt any more.")
 
+        # "ok" and "flag" are no longer offered; kept so buttons on old messages still work.
         if action == "ok":
             self.sheets.update_receipt(rid, {"review_status": STATUS_CONFIRMED})
             return OutMessage(f"👍 Confirmed {rid}.")
@@ -252,18 +320,42 @@ class Bot:
             self.set_category(receipt, code)
             vendor = receipt.get("vendor_name") or "this vendor"
             return OutMessage(f"✅ {vendor} → {self._category_name(code)}. I'll remember this vendor.")
+        if action == "chven":
+            chips = self._supplier_buttons(rid)
+            if not chips:
+                return OutMessage("The Suppliers tab in the Sheet is empty. Add supplier names there first.")
+            return OutMessage(f"Pick the supplier for {receipt.get('vendor_name') or rid}:", quick_replies=chips)
         if action == "ven":
             return self.set_vendor(receipt, q.get("v", ""))
+        if action == "price":
+            return self.ask_price(receipt, user_id, to)
         return OutMessage(HELP_TEXT)
 
     def set_vendor(self, receipt: dict[str, str], ref: str) -> OutMessage:
-        """The OCR found no vendor and the user picked one from the list."""
+        """The user picked a supplier from the Suppliers tab: the OCR found none or got it wrong."""
         rid = receipt["receipt_id"]
-        vendor = next((v for v in self.sheets.vendors() if vendor_ref(v) == ref), None)
-        if vendor is None:
-            return OutMessage("I couldn't find that vendor on the Vendors tab any more.")
+        name = next((n for n in self.sheets.suppliers() if supplier_ref(n) == ref), None)
+        if name is None:
+            return OutMessage("That supplier isn't on the Suppliers tab any more.")
+        vendors = self.sheets.vendors()
+        vendor = find_vendor(vendors, "", name) or Vendor(
+            vendor_key("", name), "", name, first_seen=self.today().isoformat()
+        )
+        old_name = receipt.get("vendor_name", "")
+        if old_name and normalize_vendor_name(old_name) != normalize_vendor_name(name):
+            wrong = find_vendor(vendors, "", old_name)
+            # Remember the misreading so the next receipt like this matches by itself.
+            if old_name not in vendor.aliases:
+                vendor.aliases.append(old_name)
+            if wrong and wrong.vendor_key != vendor.vendor_key:
+                if not wrong.category and wrong.receipt_count <= 1:
+                    self.sheets.delete_vendor(wrong.vendor_key)  # created from this misreading
+                else:
+                    wrong.receipt_count = max(0, wrong.receipt_count - 1)
+                    self.sheets.save_vendor(wrong)
+
         problems = [p for p in receipt.get("review_note", "").split("; ") if p and p != "missing vendor"]
-        fields: dict[str, Any] = {"vendor_name": vendor.name, "review_note": "; ".join(problems)}
+        fields: dict[str, Any] = {"vendor_name": name, "review_note": "; ".join(problems)}
         if receipt.get("review_status") == STATUS_REVIEW and not problems:
             fields["review_status"] = STATUS_OK
         if vendor.category:
@@ -272,11 +364,11 @@ class Bot:
         self.sheets.update_receipt(rid, fields)
         vendor.receipt_count += 1
         self.sheets.save_vendor(vendor)
-        self._rename_in_drive(receipt, vendor.name)
+        self._rename_in_drive(receipt, name)
 
         if vendor.category:
-            return OutMessage(f"✅ {vendor.name} · {self._category_name(vendor.category)}. Saved.")
-        return OutMessage(f"✅ {vendor.name}. Now pick a category:", quick_replies=self._category_buttons(rid))
+            return OutMessage(f"✅ {name} · {self._category_name(vendor.category)}. Saved.")
+        return OutMessage(f"✅ {name}. Now pick a category:", quick_replies=self._category_buttons(rid))
 
     def _rename_in_drive(self, receipt: dict[str, str], vendor_name: str) -> None:
         """Same name pattern as _finish, now that the vendor is known."""
@@ -476,7 +568,7 @@ class Bot:
             f"{d:%d/%m}" if d else "no date",
         ]
         line = " · ".join(parts) + (" ⚠️" if problems else " ✅")
-        vendor_chips = () if record.get("vendor_name") else self._vendor_buttons(rid)
+        vendor_chips = () if record.get("vendor_name") else self._supplier_buttons(rid)
         if vendor_chips:
             line += "\nWhich shop is this? Pick below."
         elif not record.get("category"):
@@ -484,9 +576,9 @@ class Bot:
         if problems:
             line += "\nCheck: " + "; ".join(problems)
         buttons = (
-            Button("OK", postback("ok", rid)),
             Button("Change category", postback("chcat", rid)),
-            Button("Flag", postback("flag", rid)),
+            Button("Change supplier", postback("chven", rid)),
+            Button("Change price", postback("price", rid)),
         )
         if vendor_chips:
             return OutMessage(line, buttons=buttons, quick_replies=vendor_chips)

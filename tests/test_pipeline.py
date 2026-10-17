@@ -98,7 +98,7 @@ def test_new_vendor_receipt_is_archived_logged_and_asks_for_category():
     assert (to, token) == (STAFF, "rt")
     assert msg.text.startswith("฿1,240 · บริษัท สยามแม็คโคร")
     assert "❓ category" in msg.text and "15/10" in msg.text
-    assert [b.label for b in msg.buttons] == ["OK", "Change category", "Flag"]
+    assert [b.label for b in msg.buttons] == ["Change category", "Change supplier", "Change price"]
     assert "Food cost" in [b.label for b in msg.quick_replies]
 
 
@@ -124,7 +124,7 @@ def test_choosing_a_category_is_remembered_for_the_vendor():
     assert vendor.receipt_count == 2 and "SIAM MAKRO" in vendor.aliases
 
 
-def test_change_category_ok_and_flag_buttons():
+def test_change_category_button():
     bot, line = make_bot()
     bot.handle(image_event())
     summary = last_reply(line)
@@ -134,9 +134,14 @@ def test_change_category_ok_and_flag_buttons():
     bot.handle(postback_event(button_data(last_reply(line), "Rent")))
     assert bot.sheets.rows[0]["category"] == "RENT"
 
-    bot.handle(postback_event(button_data(summary, "Flag")))
+
+def test_old_ok_and_flag_buttons_still_work():
+    bot, line = make_bot()
+    bot.handle(image_event())
+    rid = bot.sheets.rows[0]["receipt_id"]
+    bot.handle(postback_event(f"a=flag&r={rid}"))
     assert bot.sheets.rows[0]["review_status"] == "flagged"
-    bot.handle(postback_event(button_data(summary, "OK")))
+    bot.handle(postback_event(f"a=ok&r={rid}"))
     assert bot.sheets.rows[0]["review_status"] == "confirmed"
 
 
@@ -279,10 +284,11 @@ def test_postback_payload_fits_line_limit():
 SHOPS = ["ร้านผักสมบัติโน๊ต", "ร้านไข่นายร้อย", "ร้านหมูอนามัย BETAGRO", "ร้านหมูเจ๊จิ๋ว", "ร้านกาญ กุ้งสด"]
 
 
-def bot_with_shops():
-    bot, line = make_bot(ocr=FakeOcr(iapp_response(issuerName="", issuerTaxID="")))
-    for name in SHOPS:
-        bot.sheets.save_vendor(Vendor(vendor_key("", name), "", name, category="FOOD" if "BETAGRO" in name else ""))
+def bot_with_shops(**ocr_fields):
+    bot, line = make_bot(ocr=FakeOcr(iapp_response(**{"issuerName": "", "issuerTaxID": "", **ocr_fields})))
+    bot.sheets.supplier_names = list(SHOPS)
+    betagro = "ร้านหมูอนามัย BETAGRO"
+    bot.sheets.save_vendor(Vendor(vendor_key("", betagro), "", betagro, category="FOOD"))
     return bot, line
 
 
@@ -319,3 +325,92 @@ def test_picking_a_shop_without_a_category_then_asks_for_one():
     bot.handle(postback_event(button_data(last_reply(line), "Food cost")))
     assert bot.sheets.rows[0]["category"] == "FOOD"
     assert next(v for v in bot.sheets.vendors() if v.name == "ร้านไข่นายร้อย").category == "FOOD"
+
+
+def test_change_supplier_fixes_a_misread_name_and_learns_it():
+    bot, line = bot_with_shops(issuerName="ร้านหมูอนามัย BETAGR0", issuerTaxID="0105555000001")
+    bot.handle(image_event())
+    assert {v.name for v in bot.sheets.vendors()} == {"ร้านหมูอนามัย BETAGRO", "ร้านหมูอนามัย BETAGR0"}
+
+    bot.handle(postback_event(button_data(last_reply(line), "Change supplier")))
+    assert [b.label for b in last_reply(line).quick_replies][2] == "หมูอนามัย BETAGRO"
+    bot.handle(postback_event(button_data(last_reply(line), "หมูอนามัย BETAGRO")))
+
+    row = bot.sheets.rows[0]
+    assert row["vendor_name"] == "ร้านหมูอนามัย BETAGRO" and row["category"] == "FOOD"
+    [v] = bot.sheets.vendors()  # the entry made from the misreading is gone
+    assert v.name == "ร้านหมูอนามัย BETAGRO" and "ร้านหมูอนามัย BETAGR0" in v.aliases
+
+    # The same misreading on the next receipt now matches by itself.
+    bot.ocr.response = iapp_response(issuerName="ร้านหมูอนามัย BETAGR0", issuerTaxID="", invoiceID="INV2")
+    line.content = JPEG + b"next"
+    bot.handle(image_event(msg_id="m2"))
+    assert bot.sheets.rows[1]["category"] == "FOOD"
+
+
+def test_change_supplier_with_empty_list_says_so():
+    bot, line = make_bot()
+    bot.handle(image_event())
+    bot.handle(postback_event(button_data(last_reply(line), "Change supplier")))
+    assert "Suppliers tab" in last_reply(line).text
+
+
+def price_bot():
+    bot, line = make_bot()
+    bot.handle(image_event())
+    bot.handle(postback_event(button_data(last_reply(line), "Change price")))
+    return bot, line
+
+
+def test_change_price_asks_then_takes_the_next_message():
+    bot, line = price_bot()
+    assert last_reply(line).text.startswith("Type the correct total for บริษัท สยามแม็คโคร")
+    assert "(now ฿1,240)" in last_reply(line).text
+
+    bot.handle(text_event("twelve fifty"))
+    assert "isn't a price" in last_reply(line).text
+    bot.handle(text_event("1,250"))
+    assert "total changed from ฿1,240 to ฿1,250" in last_reply(line).text
+
+    row = bot.sheets.rows[0]
+    assert row["grand_total"] == "1,250.00" and row["net_before_vat"] == "1,168.88"  # VAT 81.12 kept
+    assert "total edited by hand (was ฿1,240)" in row["review_note"]
+    [f] = bot.drive.files.values()
+    assert f["name"].endswith("_1250.00.jpg")
+
+    sent = len(line.sent)
+    bot.handle(text_event("1300"))  # no longer waiting: ignored
+    assert len(line.sent) == sent
+
+
+def test_change_price_cancel_and_other_people_are_ignored():
+    bot, line = price_bot()
+    bot.handle(text_event("999", user=OWNER))  # someone else: not their question
+    assert bot.sheets.rows[0]["grand_total"] == "1,240.00"
+    bot.handle(text_event("summary"))  # commands still work while waiting
+    assert "Total:" in last_reply(line).text
+    bot.handle(text_event("cancel"))
+    assert "wasn't changed" in last_reply(line).text
+    bot.handle(text_event("1250"))
+    assert bot.sheets.rows[0]["grand_total"] == "1,240.00"
+
+
+def test_change_price_clears_total_warnings(monkeypatch):
+    bot, line = make_bot(ocr=FakeOcr(iapp_response(grandTotal="", vat="")))
+    bot.handle(image_event())
+    assert bot.sheets.rows[0]["review_status"] == "needs_review"
+    bot.handle(postback_event(button_data(last_reply(line), "Change price")))
+    assert "(no total yet)" in last_reply(line).text
+    bot.handle(text_event("฿1,240"))
+    row = bot.sheets.rows[0]
+    assert row["review_status"] == "ok" and row["review_note"] == "total edited by hand (was ฿?)"
+
+
+def test_change_price_wait_expires(monkeypatch):
+    bot, line = price_bot()
+    import app.pipeline as pipeline
+    real = pipeline.time.monotonic
+    monkeypatch.setattr(pipeline.time, "monotonic", lambda: real() + pipeline.PRICE_WAIT_SECONDS + 1)
+    sent = len(line.sent)
+    bot.handle(text_event("1250"))
+    assert len(line.sent) == sent and bot.sheets.rows[0]["grand_total"] == "1,240.00"

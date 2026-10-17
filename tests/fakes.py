@@ -24,6 +24,7 @@ class FakeSheets:
         self.rows: list[dict[str, str]] = []
         self.items: list[dict] = []
         self.vendor_rows: dict[str, Vendor] = {}
+        self.supplier_names: list[str] = []
         self.logs: list[tuple[str, str, str]] = []
 
     def receipts(self):
@@ -73,6 +74,12 @@ class FakeSheets:
 
     def save_vendor(self, v):
         self.vendor_rows[v.vendor_key] = v
+
+    def delete_vendor(self, key):
+        self.vendor_rows.pop(key, None)
+
+    def suppliers(self):
+        return list(self.supplier_names)
 
     def log(self, level, message, receipt_id="", now=None):
         self.logs.append((level, receipt_id, message))

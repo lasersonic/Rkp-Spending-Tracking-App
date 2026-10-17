@@ -38,6 +38,8 @@ VENDOR_COLUMNS = [
 ]
 CATEGORY_COLUMNS = ["code", "name", "group"]
 LOG_COLUMNS = ["timestamp", "level", "receipt_id", "message"]
+# The fixed list offered by "Change supplier", one name per row; edit it in the Sheet.
+SUPPLIER_COLUMNS = ["name"]
 
 TABS = {
     "Receipts": RECEIPT_COLUMNS,
@@ -45,6 +47,7 @@ TABS = {
     "Vendors": VENDOR_COLUMNS,
     "Categories": CATEGORY_COLUMNS,
     "Log": LOG_COLUMNS,
+    "Suppliers": SUPPLIER_COLUMNS,
 }
 
 # Written as real dates so Sheets formulas can group by month.
@@ -289,6 +292,14 @@ class SheetStore:
                 )
             )
         return out
+
+    def suppliers(self) -> list[str]:
+        return [r["name"].strip() for r in self._records("Suppliers") if r.get("name", "").strip()]
+
+    def delete_vendor(self, vendor_key: str) -> None:
+        row = self._find_row("Vendors", "vendor_key", vendor_key)
+        if row is not None:
+            with_retry(lambda: self.ws("Vendors").delete_rows(row), "delete vendor")
 
     def save_vendor(self, v: Vendor) -> None:
         record = {

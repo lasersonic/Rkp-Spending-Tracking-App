@@ -40,9 +40,9 @@ LINE ──forward──▶ LINE OA ──webhook──▶ Cloud Run (FastAPI)
 | You do | Bot does |
 |---|---|
 | Send/forward a photo or PDF | Archives, reads, logs and replies with a summary and buttons |
-| **OK** | `review_status = confirmed` |
 | **Change category** | Shows category chips; your choice updates the row and the vendor's memory |
-| **Flag** | `review_status = flagged` |
+| **Change supplier** | Shows the **Suppliers** tab as chips; your choice replaces the vendor, applies its category and remembers the misread name |
+| **Change price** | Asks for the correct total; your next message (e.g. `1250`, `฿1,250.50`) sets `grand_total`. `cancel` stops; it gives up after 10 minutes |
 | `summary` | Month-to-date spend by category |
 | `/retry` | Re-runs OCR on `pending_ocr` receipts (e.g. after topping up iApp) |
 | `help` | Usage |
@@ -52,10 +52,15 @@ group chat. In a group only allowlisted people are processed; turn on
 "Allow bot to join group chats" in the LINE console to invite it.
 
 The first receipt from a new vendor asks for a category. Every later receipt
-from that vendor is categorized automatically.
+from that vendor is categorized automatically. When the OCR finds no vendor,
+the reply asks "Which shop is this?" with the same Suppliers chips.
+
+The **Suppliers** tab is a fixed list you maintain: one name per row in the
+`name` column, up to 13 shown. The **Vendors** tab is the bot's own memory of
+categories, tax IDs and alternative spellings.
 
 `review_status` values: `ok`, `needs_review` (a check failed; see `review_note`),
-`pending_ocr`, `flagged`, `confirmed`.
+`pending_ocr`; `flagged` and `confirmed` can be typed in by hand.
 
 ## Setup
 
