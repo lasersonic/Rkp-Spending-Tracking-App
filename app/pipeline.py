@@ -41,7 +41,7 @@ _lock = threading.Lock()
 HELP_TEXT = (
     "📸 Forward a receipt photo or PDF here and I'll archive it, read it and log it.\n\n"
     "Commands:\n"
-    "• สรุป / summary – this month's spend by category\n"
+    "• summary – this month's spend by category\n"
     "• /retry – re-run OCR on receipts that are pending\n"
     "• help – this message"
 )
@@ -175,13 +175,14 @@ class Bot:
             elif isinstance(event.message, TextMessageContent):
                 msg = self.handle_text(event.message.text)
             else:
-                msg = OutMessage(HELP_TEXT)
+                msg = None  # stickers, locations, etc.
         except Exception as exc:
             log.exception("event failed")
             self.sheets.log("ERROR", f"{type(exc).__name__}: {exc}")
             self.notify_owner(f"Bot error: {type(exc).__name__}. See the Log tab.")
             msg = OutMessage("Sorry, something went wrong. The owner has been notified; please try again later.")
-        self.line.send(to, msg, reply_token)
+        if msg is not None:
+            self.line.send(to, msg, reply_token)
 
     def handle_file_message(self, message, user_id: str, to: str) -> OutMessage:
         if isinstance(message, FileMessageContent):
@@ -195,13 +196,16 @@ class Bot:
         content = self.line.download(message.id)
         return self.process_file(content, filename, submitted_by=user_id, source="line").message
 
-    def handle_text(self, text: str) -> OutMessage:
+    def handle_text(self, text: str) -> OutMessage | None:
+        """Only exact commands get an answer; any other chat is ignored."""
         t = text.strip().lower()
-        if t in {"สรุป", "summary", "/summary"}:
+        if t in {"summary", "/summary"}:
             return self.month_summary()
         if t in {"/retry", "retry"}:
             return self.retry_pending()
-        return OutMessage(HELP_TEXT)
+        if t in {"help", "/help"}:
+            return OutMessage(HELP_TEXT)
+        return None
 
     def handle_postback(self, data: str) -> OutMessage:
         q = {k: v[0] for k, v in parse_qs(data).items()}

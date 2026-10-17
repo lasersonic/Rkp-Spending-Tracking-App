@@ -9,3 +9,4 @@ drive_token.json
 sa.json
 *-sa.json
 ChatExport_*/
+*.tar.gz

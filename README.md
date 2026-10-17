@@ -24,7 +24,7 @@ LINE ──forward──▶ LINE OA ──webhook──▶ Cloud Run (FastAPI)
 | File | What it does |
 |---|---|
 | `app/main.py` | `POST /callback`: checks the LINE signature, returns 200, processes in the background |
-| `app/pipeline.py` | The pipeline above, buttons, `สรุป`/`summary`, `/retry`, `help` |
+| `app/pipeline.py` | The pipeline above, buttons, `summary`, `/retry`, `help` |
 | `app/iapp.py` | OCR call with retries; maps iApp fields to columns |
 | `app/normalize.py` | Thai dates/amounts, the validation rules |
 | `app/categorize.py` | Categories and vendor matching (tax ID, then name/aliases) |
@@ -43,9 +43,13 @@ LINE ──forward──▶ LINE OA ──webhook──▶ Cloud Run (FastAPI)
 | **OK** | `review_status = confirmed` |
 | **Change category** | Shows category chips; your choice updates the row and the vendor's memory |
 | **Flag** | `review_status = flagged` |
-| `สรุป` / `summary` | Month-to-date spend by category |
+| `summary` | Month-to-date spend by category |
 | `/retry` | Re-runs OCR on `pending_ocr` receipts (e.g. after topping up iApp) |
 | `help` | Usage |
+
+Any other message (chat, stickers) gets no reply, so the bot can sit in a
+group chat. In a group only allowlisted people are processed; turn on
+"Allow bot to join group chats" in the LINE console to invite it.
 
 The first receipt from a new vendor asks for a category. Every later receipt
 from that vendor is categorized automatically.

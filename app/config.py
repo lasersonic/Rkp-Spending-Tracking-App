@@ -68,4 +68,9 @@ class Settings:
 
 @lru_cache
 def get_settings() -> Settings:
+    # Local dev: pick up a .env file in the working directory. Real env vars
+    # (e.g. Cloud Run secrets) win; the file is gitignored and not in the image.
+    from dotenv import load_dotenv
+
+    load_dotenv(override=False)
     return Settings.from_env()

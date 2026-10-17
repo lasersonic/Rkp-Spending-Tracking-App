@@ -1,0 +1,12 @@
+# Files that never leave this machine when deploying with `gcloud run deploy --source`.
+.gcloudignore
+.git
+.gitignore
+.venv/
+__pycache__/
+.pytest_cache/
+tests/
+.env
+*.json
+*.tar.gz
+ChatExport_*/

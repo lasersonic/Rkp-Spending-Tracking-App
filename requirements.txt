@@ -6,3 +6,4 @@ gspread==6.2.1
 google-auth==2.62.0
 google-api-python-client==2.201.0
 google-auth-oauthlib==1.5.0
+python-dotenv==1.1.1

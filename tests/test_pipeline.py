@@ -19,19 +19,26 @@ def make_bot(ocr=None, drive=None, content=JPEG):
     return bot, line
 
 
-def _base(user, reply_token="rt"):
-    return {"source": {"type": "user", "userId": user}, "timestamp": 0, "mode": "active",
+def _base(user, reply_token="rt", group=None):
+    source = {"type": "group", "groupId": group, "userId": user} if group else {"type": "user", "userId": user}
+    return {"source": source, "timestamp": 0, "mode": "active",
             "webhookEventId": "w", "deliveryContext": {"isRedelivery": False}, "replyToken": reply_token}
 
 
-def image_event(user=STAFF, msg_id="m1"):
-    return MessageEvent.from_dict({**_base(user), "type": "message",
+def image_event(user=STAFF, msg_id="m1", group=None):
+    return MessageEvent.from_dict({**_base(user, group=group), "type": "message",
                                    "message": {"type": "image", "id": msg_id, "quoteToken": "q", "contentProvider": {"type": "line"}}})
 
 
-def text_event(text, user=STAFF):
-    return MessageEvent.from_dict({**_base(user), "type": "message",
+def text_event(text, user=STAFF, group=None):
+    return MessageEvent.from_dict({**_base(user, group=group), "type": "message",
                                    "message": {"type": "text", "id": "t1", "text": text, "quoteToken": "q"}})
+
+
+def sticker_event(user=STAFF, group=None):
+    return MessageEvent.from_dict({**_base(user, group=group), "type": "message",
+                                   "message": {"type": "sticker", "id": "s1", "quoteToken": "q", "packageId": "1",
+                                               "stickerId": "1", "stickerResourceType": "STATIC"}})
 
 
 def postback_event(data, user=STAFF):
@@ -221,12 +228,31 @@ def test_month_summary_and_help():
     bot, line = make_bot()
     bot.handle(image_event())
     bot.handle(postback_event(button_data(last_reply(line), "Food cost")))
-    bot.handle(text_event("สรุป"))
+    bot.handle(text_event("Summary"))
     text = last_reply(line).text
     assert "10/2026" in text and "Food cost: ฿1,240" in text and "Total: ฿1,240" in text
 
-    bot.handle(text_event("hello"))
+    bot.handle(text_event("help"))
     assert "Forward a receipt" in last_reply(line).text
+
+
+def test_other_messages_are_ignored():
+    bot, line = make_bot()
+    for event in (text_event("hello"), text_event("สรุป"), text_event("summary please"), sticker_event(),
+                  text_event("hello", group="Cgroup"), sticker_event(group="Cgroup")):
+        bot.handle(event)
+    assert line.sent == []
+
+
+def test_group_chat_receipt_and_commands_reply_to_group():
+    bot, line = make_bot()
+    bot.handle(image_event(group="Cgroup"))
+    assert bot.sheets.rows and line.sent[-1][0] == "Cgroup"
+    bot.handle(text_event("summary", group="Cgroup"))
+    assert line.sent[-1][0] == "Cgroup" and "Total:" in last_reply(line).text
+    sent = len(line.sent)
+    bot.handle(text_event("hi", user="Ustranger", group="Cgroup"))
+    assert len(line.sent) == sent  # strangers are ignored in groups
 
 
 def test_postback_payload_fits_line_limit():
