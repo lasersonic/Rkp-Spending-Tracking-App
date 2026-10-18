@@ -254,6 +254,45 @@ def test_month_summary_and_help():
     assert "Forward a receipt" in last_reply(line).text
 
 
+def test_daily_lists_receipts_logged_today():
+    bot, line = make_bot()
+    bot.handle(text_event("daily"))
+    assert last_reply(line).text == "No receipts logged today (17/10) yet."
+
+    bot.handle(image_event())
+    bot.handle(postback_event(button_data(last_reply(line), "Food cost")))
+    # Logged yesterday (even though dated today) and a pending one from today.
+    bot.sheets.rows.append({"receipt_id": "R261016-aaaaaa", "received_at": "2026-10-16 09:00:00",
+                            "receipt_date": "2026-10-17", "grand_total": "99.00", "review_status": "ok"})
+    bot.sheets.rows.append({"receipt_id": "R261017-bbbbbb", "received_at": "2026-10-17 15:00:00",
+                            "review_status": "pending_ocr"})
+    bot.handle(text_event("/Daily"))
+    assert last_reply(line).text.splitlines() == [
+        "🧾 Today 17/10 (2 receipts)",
+        "• ฿1,240 · บริษัท สยามแม็คโคร จำกัด (มหาชน) · Food cost ✅",
+        "• ⏳ R261017-bbbbbb · waiting for OCR",
+        "Total: ฿1,240",
+    ]
+
+    bot.handle(text_event("help"))
+    assert "daily – receipts logged today" in last_reply(line).text
+
+
+def test_daily_caps_a_long_list():
+    bot, line = make_bot()
+    bot.sheets.rows.extend(
+        {"receipt_id": f"R{n}", "received_at": "2026-10-17 08:00:00", "vendor_name": f"Shop {n}",
+         "grand_total": "10.00", "review_status": "needs_review"}
+        for n in range(35)
+    )
+    bot.handle(text_event("daily"))
+    lines = last_reply(line).text.splitlines()
+    assert lines[0] == "🧾 Today 17/10 (35 receipts)"
+    assert lines[1] == "• ฿10 · Shop 0 · ❓ category ⚠️"
+    assert lines[-2:] == ["…and 5 more (see the Sheet)", "Total: ฿350"]
+    assert len(lines) == 33
+
+
 def test_other_messages_are_ignored():
     bot, line = make_bot()
     for event in (text_event("hello"), text_event("สรุป"), text_event("summary please"), sticker_event(),

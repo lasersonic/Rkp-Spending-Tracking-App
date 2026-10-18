@@ -41,6 +41,7 @@ _lock = threading.Lock()
 HELP_TEXT = (
     "📸 Forward a receipt photo or PDF here and I'll archive it, read it and log it.\n\n"
     "Commands:\n"
+    "• daily – receipts logged today\n"
     "• summary – this month's spend by category\n"
     "• /retry – re-run OCR on receipts that are pending\n"
     "• help – this message"
@@ -48,6 +49,7 @@ HELP_TEXT = (
 
 CATEGORY_CACHE_SECONDS = 300
 PRICE_WAIT_SECONDS = 600
+DAILY_LIST_LIMIT = 30  # keeps the "daily" reply well under LINE's 5,000-character limit
 
 STATUS_OK = "ok"
 STATUS_REVIEW = "needs_review"
@@ -233,6 +235,8 @@ class Bot:
         """Only exact commands get an answer, plus the reply to "Change price";
         any other chat is ignored."""
         t = text.strip().lower()
+        if t in {"daily", "/daily"}:
+            return self.daily_list()
         if t in {"summary", "/summary"}:
             return self.month_summary()
         if t in {"/retry", "retry"}:
@@ -607,6 +611,31 @@ class Bot:
             name = self._category_name(code) if code != "?" else "Uncategorized"
             lines.append(f"• {name}: {fmt_baht(amount)}")
         lines.append(f"Total: {fmt_baht(sum(totals.values()))}")
+        return OutMessage("\n".join(lines))
+
+    def daily_list(self) -> OutMessage:
+        """Receipts the bot logged today (by when they arrived, not the date printed on them)."""
+        today = self.today()
+        rows = [r for r in self.sheets.receipts() if parse_date(r.get("received_at"), today) == today]
+        if not rows:
+            return OutMessage(f"No receipts logged today ({today:%d/%m}) yet.")
+        icons = {STATUS_OK: "✅", STATUS_CONFIRMED: "✅", STATUS_REVIEW: "⚠️",
+                 STATUS_FLAGGED: "🚩", STATUS_PENDING: "⏳"}
+        entries = []
+        for r in rows:
+            status = r.get("review_status", "")
+            if status == STATUS_PENDING:
+                entries.append(f"⏳ {r.get('receipt_id', '')} · waiting for OCR")
+                continue
+            category = self._category_name(r["category"]) if r.get("category") else "❓ category"
+            parts = [fmt_baht(parse_amount(r.get("grand_total"))), r.get("vendor_name") or "Unknown vendor", category]
+            entries.append(" · ".join(parts) + f" {icons.get(status, '')}".rstrip())
+        lines = [f"🧾 Today {today:%d/%m} ({len(rows)} receipt{'s' if len(rows) != 1 else ''})"]
+        lines += [f"• {e}" for e in entries[: DAILY_LIST_LIMIT]]
+        if len(entries) > DAILY_LIST_LIMIT:
+            lines.append(f"…and {len(entries) - DAILY_LIST_LIMIT} more (see the Sheet)")
+        total = sum((a for r in rows if (a := parse_amount(r.get("grand_total"))) is not None), Decimal(0))
+        lines.append(f"Total: {fmt_baht(total)}")
         return OutMessage("\n".join(lines))
 
     def retry_pending(self) -> OutMessage:

@@ -43,6 +43,7 @@ LINE ──forward──▶ LINE OA ──webhook──▶ Cloud Run (FastAPI)
 | **Change category** | Shows category chips; your choice updates the row and the vendor's memory |
 | **Change supplier** | Shows the **Suppliers** tab as chips; your choice replaces the vendor, applies its category and remembers the misread name |
 | **Change price** | Asks for the correct total; your next message (e.g. `1250`, `฿1,250.50`) sets `grand_total`. `cancel` stops; it gives up after 10 minutes |
+| `daily` | Receipts logged today (by arrival time): amount, vendor, category, status, and the day's total |
 | `summary` | Month-to-date spend by category |
 | `/retry` | Re-runs OCR on `pending_ocr` receipts (e.g. after topping up iApp) |
 | `help` | Usage |
