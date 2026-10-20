@@ -15,10 +15,10 @@ from linebot.v3 import WebhookParser
 from linebot.v3.exceptions import InvalidSignatureError
 
 from .config import get_settings
-from .iapp import IappClient
 from .line_client import LineClient
 from .pipeline import Bot
 from .storage import DriveStore, SheetStore
+from .vision import VisionClient
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 log = logging.getLogger(__name__)
@@ -41,7 +41,7 @@ def get_bot() -> Bot:
         line=LineClient(s.line_channel_access_token),
         sheets=sheets,
         drive=DriveStore.from_settings(s.google_sa_info, s.google_drive_token_info, s.drive_folder_id),
-        ocr=IappClient(s.iapp_api_key, s.iapp_url),
+        ocr=VisionClient(s.google_sa_info),
     )
 
 

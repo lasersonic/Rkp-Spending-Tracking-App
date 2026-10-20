@@ -46,7 +46,7 @@ def test_import_dedupes_and_queues_vendor_categories(tmp_path, monkeypatch, caps
     assert bot.sheets.rows[0]["category"] == "FOOD"
 
 
-def test_dry_run_estimates_cost(tmp_path, monkeypatch, capsys):
+def test_dry_run_counts_pages(tmp_path, monkeypatch, capsys):
     make_export(tmp_path)
     monkeypatch.setattr(backfill, "make_bot", lambda: (_ for _ in ()).throw(AssertionError("no API calls")))
     backfill.main(["import", str(tmp_path), "--dry-run"])

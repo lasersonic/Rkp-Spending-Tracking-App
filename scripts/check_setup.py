@@ -1,10 +1,10 @@
-"""Pre-flight check: are LINE, iApp, Google Sheets and Drive set up correctly?
+"""Pre-flight check: are LINE, Google Vision, Sheets and Drive set up correctly?
 
 Run it with the same environment variables as the bot (see README → Secrets):
 
     python -m scripts.check_setup
     python -m scripts.check_setup --service-url https://expense-bot-xxxx.a.run.app
-    python -m scripts.check_setup --ocr-sample receipt.jpg   # one real OCR call, ~1.34 ฿
+    python -m scripts.check_setup --ocr-sample receipt.jpg   # one real OCR call (free tier)
 
 Nothing is changed except a tiny test file that is created in the Drive
 folder and deleted straight away.
@@ -25,6 +25,11 @@ from app.storage import TABS
 
 OK, WARN, FAIL = "✅", "⚠️ ", "❌"
 LINE_USER_ID = re.compile(r"^U[0-9a-f]{32}$")
+# A 1x1 white PNG for the Vision check.
+BLANK_PNG = bytes.fromhex(
+    "89504e470d0a1a0a0000000d4948445200000001000000010802000000907753de"
+    "0000000c49444154789c63f8ffff3f0005fe02fe0def46b80000000049454e44ae426082"
+)
 
 
 @dataclass
@@ -39,7 +44,6 @@ def check_config(s: Settings) -> list[Result]:
     required = {
         "LINE_CHANNEL_SECRET": s.line_channel_secret,
         "LINE_CHANNEL_ACCESS_TOKEN": s.line_channel_access_token,
-        "IAPP_API_KEY": s.iapp_api_key,
         "GOOGLE_SA_JSON": s.google_sa_info,
         "SHEET_ID": s.sheet_id,
         "DRIVE_FOLDER_ID": s.drive_folder_id,
@@ -91,37 +95,32 @@ def check_line(s: Settings) -> list[Result]:
     return out
 
 
-def check_iapp(s: Settings, sample: Path | None) -> list[Result]:
-    from app.iapp import IappClient, IappAuthError, IappError, parse_response
+def check_vision(s: Settings, sample: Path | None) -> list[Result]:
     from app.pipeline import detect_type
+    from app.vision import OcrAuthError, OcrError, VisionClient
 
+    client = VisionClient(s.google_sa_info)
     if sample is None:
-        # An empty upload can't be OCR'd, so it shouldn't use credits; a wrong
-        # key should still be refused with 401/403.
+        # A blank image: proves the API is enabled and the key may call it (1 of the free 1,000/month).
         try:
-            resp = httpx.post(s.iapp_url, headers={"apikey": s.iapp_api_key},
-                              files={"file": ("empty.jpg", b"", "image/jpeg")}, timeout=30)
-        except httpx.HTTPError as exc:
-            return [Result(FAIL, "iApp API", f"can't reach {s.iapp_url}: {type(exc).__name__}")]
-        if resp.status_code in (401, 403):
-            return [Result(FAIL, "iApp API key", f"rejected (HTTP {resp.status_code})")]
-        if resp.status_code == 402:
-            return [Result(FAIL, "iApp credits", "out of credits (HTTP 402)")]
-        return [Result(OK, "iApp API key", f"accepted (HTTP {resp.status_code} for an empty file); use --ocr-sample for a full test")]
+            client.ocr(BLANK_PNG, "blank.png", "image/png")
+        except OcrAuthError as exc:
+            return [Result(FAIL, "Vision API", f"{exc} (enable the Cloud Vision API and billing on the project)")]
+        except OcrError as exc:
+            return [Result(FAIL, "Vision API", str(exc))]
+        return [Result(OK, "Vision API", "enabled and accepts the service account; use --ocr-sample for a full test")]
 
     content = sample.read_bytes()
     kind = detect_type(content)
     if not kind:
-        return [Result(FAIL, "iApp OCR", f"{sample} is not a JPG/PNG/HEIC/PDF")]
+        return [Result(FAIL, "Vision OCR", f"{sample} is not a JPG/PNG/PDF")]
     try:
-        r = parse_response(IappClient(s.iapp_api_key, s.iapp_url).ocr(content, sample.name, kind[0]))
-    except IappAuthError as exc:
-        return [Result(FAIL, "iApp OCR", str(exc))]
-    except IappError as exc:
-        return [Result(FAIL, "iApp OCR", str(exc))]
+        r = client.read(content, sample.name, kind[0])
+    except OcrError as exc:
+        return [Result(FAIL, "Vision OCR", str(exc))]
     found = f"{r.vendor_name or '?'} · {r.grand_total} ฿ · {r.receipt_date} · {len(r.items)} items · conf {r.min_confidence}"
     status = OK if r.grand_total is not None else WARN
-    return [Result(status, "iApp OCR", found + ("" if status == OK else " (no grand total parsed; share the raw JSON)"))]
+    return [Result(status, "Vision OCR", found + ("" if status == OK else " (no grand total found)"))]
 
 
 def _google_error(exc: Exception) -> str:
@@ -211,16 +210,16 @@ def check_service(url: str) -> list[Result]:
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--service-url", help="deployed Cloud Run URL, to check the webhook itself")
-    p.add_argument("--ocr-sample", type=Path, help="run one real receipt through iApp (costs ~1.34 ฿)")
-    p.add_argument("--skip", nargs="*", default=[], choices=["line", "iapp", "sheets", "drive"])
+    p.add_argument("--ocr-sample", type=Path, help="run one real receipt through Google Vision")
+    p.add_argument("--skip", nargs="*", default=[], choices=["line", "vision", "sheets", "drive"])
     args = p.parse_args(argv)
 
     s = get_settings()
     results = check_config(s)
     if "line" not in args.skip and s.line_channel_access_token:
         results += check_line(s)
-    if "iapp" not in args.skip and s.iapp_api_key:
-        results += check_iapp(s, args.ocr_sample)
+    if "vision" not in args.skip and s.google_sa_info:
+        results += check_vision(s, args.ocr_sample)
     if "sheets" not in args.skip and s.google_sa_info and s.sheet_id:
         results += check_sheets(s)
     if "drive" not in args.skip and s.drive_folder_id and (s.google_sa_info or s.google_drive_token_info):

@@ -28,7 +28,6 @@ def _json_or_path(value: str) -> dict | None:
 class Settings:
     line_channel_secret: str = ""
     line_channel_access_token: str = ""
-    iapp_api_key: str = ""
     google_sa_info: dict | None = None
     # OAuth user token for Drive. Needed on personal Google accounts, where a
     # service account has no storage quota and cannot own uploaded files.
@@ -38,7 +37,6 @@ class Settings:
     allowed_user_ids: frozenset[str] = field(default_factory=frozenset)
     owner_user_id: str = ""
     tz_name: str = "Asia/Bangkok"
-    iapp_url: str = "https://api.iapp.co.th/ocr/v3/receipt/file"
 
     @property
     def tz(self) -> ZoneInfo:
@@ -54,7 +52,6 @@ class Settings:
         return cls(
             line_channel_secret=env.get("LINE_CHANNEL_SECRET", ""),
             line_channel_access_token=env.get("LINE_CHANNEL_ACCESS_TOKEN", ""),
-            iapp_api_key=env.get("IAPP_API_KEY", ""),
             google_sa_info=_json_or_path(env.get("GOOGLE_SA_JSON", "")),
             google_drive_token_info=_json_or_path(env.get("GOOGLE_DRIVE_TOKEN_JSON", "")),
             sheet_id=env.get("SHEET_ID", ""),
@@ -62,7 +59,6 @@ class Settings:
             allowed_user_ids=allowed,
             owner_user_id=owner,
             tz_name=env.get("TZ", "Asia/Bangkok") or "Asia/Bangkok",
-            iapp_url=env.get("IAPP_URL", cls.iapp_url),
         )
 
 

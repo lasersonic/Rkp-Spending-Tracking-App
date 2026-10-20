@@ -28,7 +28,7 @@ from linebot.v3.webhooks import (
 
 from .categorize import Category, Vendor, find_vendor, normalize_vendor_name, short_name, vendor_key
 from .config import Settings
-from .iapp import MAX_BYTES, MAX_PDF_PAGES, IappAuthError, IappError, parse_response
+from .vision import MAX_BYTES, MAX_PDF_PAGES, OcrAuthError, OcrError
 from .line_client import Button, OutMessage
 from .normalize import ReceiptData, parse_amount, parse_date, validate
 from .storage import drive_file_id
@@ -222,7 +222,7 @@ class Bot:
     def handle_file_message(self, message, user_id: str, to: str) -> OutMessage:
         if isinstance(message, FileMessageContent):
             if message.file_size and message.file_size > MAX_BYTES:
-                return OutMessage(f"That file is {message.file_size / 1_048_576:.1f} MB; the limit is 10 MB.")
+                return OutMessage(f"That file is {message.file_size / 1_048_576:.1f} MB; the limit is {MAX_BYTES // 1_048_576} MB.")
             filename = message.file_name or f"{message.id}.pdf"
         else:
             filename = f"{message.id}.jpg"
@@ -454,9 +454,11 @@ class Bot:
         # 2. Check the OCR limits, then OCR.
         limit_problem = ""
         if len(content) > MAX_BYTES:
-            limit_problem = f"file is {len(content) / 1_048_576:.1f} MB (OCR limit 10 MB)"
+            limit_problem = f"file is {len(content) / 1_048_576:.1f} MB (OCR limit {MAX_BYTES // 1_048_576} MB)"
         elif pages > MAX_PDF_PAGES:
             limit_problem = f"PDF has {pages} pages (OCR limit {MAX_PDF_PAGES})"
+        elif mime == "image/heic":
+            limit_problem = "HEIC files can't be read by the OCR; send it as a normal photo instead"
         if limit_problem:
             record.update(review_status=STATUS_REVIEW, review_note=f"{limit_problem}; enter manually")
             self.sheets.add_receipt(record, [])
@@ -487,13 +489,15 @@ class Bot:
 
     def _run_ocr(self, content: bytes, filename: str, mime: str, receipt_id: str, as_of: date) -> _Ocr:
         try:
-            raw = self.ocr.ocr(content, filename, mime)
-            data = parse_response(raw, as_of)
-        except IappAuthError as exc:
+            data = self.ocr.read(content, filename, mime, as_of)
+        except OcrAuthError as exc:
             self.sheets.log("ERROR", str(exc), receipt_id, self.now())
-            self.notify_owner(f"iApp OCR: {exc}. Receipts are being saved as pending_ocr; top up, then send /retry.")
+            self.notify_owner(
+                f"Google Vision OCR: {exc}. Receipts are being saved as pending_ocr; "
+                "check the Vision API and billing in Google Cloud, then send /retry."
+            )
             return _Ocr(error=str(exc))
-        except IappError as exc:
+        except OcrError as exc:
             self.sheets.log("WARN", f"OCR failed: {exc}", receipt_id, self.now())
             return _Ocr(error=str(exc))
         return _Ocr(data=data, problems=validate(data, as_of))

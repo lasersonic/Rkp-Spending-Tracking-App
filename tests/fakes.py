@@ -1,11 +1,13 @@
-"""In-memory stand-ins for LINE, iApp, Sheets and Drive."""
+"""In-memory stand-ins for LINE, Google Vision, Sheets and Drive."""
 
 from __future__ import annotations
 
+import copy
 from datetime import date, datetime
 from decimal import Decimal
 
 from app.categorize import DEFAULT_CATEGORIES, Vendor, normalize_vendor_name
+from app.normalize import LineItem, ReceiptData, parse_amount
 from app.storage import RECEIPT_COLUMNS, to_cell
 
 
@@ -128,48 +130,45 @@ class FakeLine:
 
 
 class FakeOcr:
-    def __init__(self, response=None, error: Exception | None = None):
+    """Stands in for VisionClient: returns a ready-parsed receipt."""
+
+    def __init__(self, response: ReceiptData | None = None, error: Exception | None = None):
         self.response = response
         self.error = error
         self.calls = 0
 
-    def ocr(self, content, filename, mime):
+    def read(self, content, filename, mime, today=None):
         self.calls += 1
         if self.error:
             raise self.error
-        return self.response
+        return copy.deepcopy(self.response)
 
 
-def iapp_response(**overrides):
-    """An iApp v3 response in the documented layout, with {value, confidence} fields."""
-    fields = {
-        "invoiceType": "ใบกำกับภาษี/ใบเสร็จรับเงิน",
-        "invoiceBook": "",
-        "invoiceID": "INV0012345",
-        "invoiceDate": "15/10/2569",
-        "purchaseOrderID": "",
-        "issuerName": "บริษัท สยามแม็คโคร จำกัด (มหาชน)",
-        "issuerTaxID": "0107537000521",
-        "issuerPhone": "02-067-8999",
-        "issuerAddress": "1468 ถนนพัฒนาการ กรุงเทพฯ",
-        "customerName": "ร้านอาหาร RKP",
-        "customerTaxID": "",
-        "totalCost": "1,240.00",
-        "discount": "0.00",
-        "totalCostAfterDiscount": "1,240.00",
-        "vat": "81.12",
-        "grandTotal": "1,240.00",
-    }
-    fields.update(overrides)
-    data = {k: {"value": v, "confidence": 0.97} for k, v in fields.items()}
-    data["items"] = [
-        {"itemName": {"value": "หมูสามชั้น", "confidence": 0.95}, "itemQuantity": "2",
-         "itemUnitCost": "300.00", "itemTotalCost": "600.00"},
-        {"itemName": {"value": "ผักกาดขาว", "confidence": 0.93}, "itemQuantity": "4",
-         "itemUnitCost": "160.00", "itemTotalCost": "640.00"},
-    ]
-    # Layout from iApp's docs: fields under "processed", OCR extras under "raw".
-    return {"message": "success", "processed": data, "raw": {}}
+def receipt(**overrides) -> ReceiptData:
+    """A parsed Makro tax invoice. Amount overrides may be strings ("" means not found)."""
+    r = ReceiptData(
+        doc_type="ใบกำกับภาษี/ใบเสร็จรับเงิน",
+        invoice_no="INV0012345",
+        raw_date="15/10/2569",
+        receipt_date=date(2026, 10, 15),
+        vendor_name="บริษัท สยามแม็คโคร จำกัด (มหาชน)",
+        vendor_tax_id="0107537000521",
+        vendor_phone="02-067-8999",
+        customer_name="ร้านอาหาร RKP",
+        subtotal=Decimal("1240.00"),
+        vat=Decimal("81.12"),
+        grand_total=Decimal("1240.00"),
+        items=[
+            LineItem(1, item_name="หมูสามชั้น", qty=Decimal("2"), unit_cost=Decimal("300.00"), total_cost=Decimal("600.00")),
+            LineItem(2, item_name="ผักกาดขาว", qty=Decimal("4"), unit_cost=Decimal("160.00"), total_cost=Decimal("640.00")),
+        ],
+        min_confidence=0.93,
+    )
+    for key, value in overrides.items():
+        if key in {"subtotal", "discount", "after_discount", "vat", "grand_total"} and isinstance(value, str):
+            value = parse_amount(value)
+        setattr(r, key, value)
+    return r
 
 
 JPEG = b"\xff\xd8\xff\xe0" + b"fake-jpeg-body"

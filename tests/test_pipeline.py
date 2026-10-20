@@ -4,10 +4,10 @@ from linebot.v3.webhooks import MessageEvent, PostbackEvent
 
 from app.categorize import Vendor, vendor_key
 from app.config import Settings
-from app.iapp import IappAuthError, IappError
 from app.line_client import OutMessage
 from app.pipeline import Bot, detect_type, file_slug, fmt_baht, pdf_page_count
-from tests.fakes import JPEG, NOW, TOTAL, FakeDrive, FakeLine, FakeOcr, FakeSheets, iapp_response
+from app.vision import OcrAuthError, OcrError
+from tests.fakes import JPEG, NOW, TOTAL, FakeDrive, FakeLine, FakeOcr, FakeSheets, receipt
 
 OWNER = "Uowner"
 STAFF = "Ustaff"
@@ -16,7 +16,7 @@ STAFF = "Ustaff"
 def make_bot(ocr=None, drive=None, content=JPEG):
     settings = Settings(allowed_user_ids=frozenset({OWNER, STAFF}), owner_user_id=OWNER)
     line = FakeLine(content)
-    bot = Bot(settings, line, FakeSheets(), drive or FakeDrive(), ocr or FakeOcr(iapp_response()), now=lambda: NOW)
+    bot = Bot(settings, line, FakeSheets(), drive or FakeDrive(), ocr or FakeOcr(receipt()), now=lambda: NOW)
     return bot, line
 
 
@@ -114,7 +114,7 @@ def test_choosing_a_category_is_remembered_for_the_vendor():
     assert "I'll remember" in last_reply(line).text
 
     # Next receipt from the same vendor is categorized automatically.
-    bot.ocr.response = iapp_response(invoiceID="INV0099999", issuerName="SIAM MAKRO")
+    bot.ocr.response = receipt(invoice_no="INV0099999", vendor_name="SIAM MAKRO")
     line.content = JPEG + b"second"
     bot.handle(image_event(msg_id="m2"))
     assert bot.sheets.rows[1]["category"] == "FOOD"
@@ -146,7 +146,7 @@ def test_old_ok_and_flag_buttons_still_work():
 
 
 def test_validation_problems_set_review_flag():
-    bot, line = make_bot(ocr=FakeOcr(iapp_response(vat="10.00")))
+    bot, line = make_bot(ocr=FakeOcr(receipt(vat="10.00")))
     bot.handle(image_event())
     row = bot.sheets.rows[0]
     assert row["review_status"] == "needs_review"
@@ -183,18 +183,18 @@ def test_vendor_without_tax_id_learns_it():
 
 
 def test_out_of_credits_keeps_file_and_alerts_owner_then_retry_works():
-    ocr = FakeOcr(error=IappAuthError("iApp returned 402 (bad key or out of credits)"))
+    ocr = FakeOcr(error=OcrAuthError("Vision API returned 403: billing is disabled"))
     bot, line = make_bot(ocr=ocr)
     bot.handle(image_event())
 
     [row] = bot.sheets.rows
     assert row["review_status"] == "pending_ocr"
     assert len(bot.drive.files) == 1
-    assert any(to == OWNER and "402" in m.text for to, m, _ in line.sent)
+    assert any(to == OWNER and "403" in m.text for to, m, _ in line.sent)
     assert "/retry" in last_reply(line).text
 
     ocr.error = None
-    ocr.response = iapp_response()
+    ocr.response = receipt()
     bot.handle(text_event("/retry"))
     assert "1 logged" in last_reply(line).text
     row = bot.sheets.rows[0]
@@ -204,7 +204,7 @@ def test_out_of_credits_keeps_file_and_alerts_owner_then_retry_works():
 
 
 def test_transient_ocr_failure_is_pending():
-    bot, line = make_bot(ocr=FakeOcr(error=IappError("iApp returned 503")))
+    bot, line = make_bot(ocr=FakeOcr(error=OcrError("Vision API returned 503")))
     bot.handle(image_event())
     assert bot.sheets.rows[0]["review_status"] == "pending_ocr"
     assert not any(to == OWNER for to, _, _ in line.sent)  # only auth errors alert the owner
@@ -233,6 +233,14 @@ def test_pdf_over_page_limit_is_archived_for_manual_entry():
     assert len(bot.drive.files) == 1
     assert bot.sheets.rows[0]["review_status"] == "needs_review"
     assert "11 pages" in last_reply(line).text
+
+
+def test_heic_is_archived_but_not_sent_to_ocr():
+    bot, line = make_bot(content=b"\x00\x00\x00\x18ftypheic....")
+    bot.handle(image_event())
+    assert bot.ocr.calls == 0
+    assert len(bot.drive.files) == 1 and bot.sheets.rows[0]["review_status"] == "needs_review"
+    assert "send it as a normal photo" in last_reply(line).text
 
 
 def test_stranger_is_rejected_with_their_id():
@@ -324,7 +332,7 @@ SHOPS = ["ร้านผักสมบัติโน๊ต", "ร้านไ
 
 
 def bot_with_shops(**ocr_fields):
-    bot, line = make_bot(ocr=FakeOcr(iapp_response(**{"issuerName": "", "issuerTaxID": "", **ocr_fields})))
+    bot, line = make_bot(ocr=FakeOcr(receipt(**{"vendor_name": "", "vendor_tax_id": "", **ocr_fields})))
     bot.sheets.supplier_names = list(SHOPS)
     betagro = "ร้านหมูอนามัย BETAGRO"
     bot.sheets.save_vendor(Vendor(vendor_key("", betagro), "", betagro, category="FOOD"))
@@ -367,7 +375,7 @@ def test_picking_a_shop_without_a_category_then_asks_for_one():
 
 
 def test_change_supplier_fixes_a_misread_name_and_learns_it():
-    bot, line = bot_with_shops(issuerName="ร้านหมูอนามัย BETAGR0", issuerTaxID="0105555000001")
+    bot, line = bot_with_shops(vendor_name="ร้านหมูอนามัย BETAGR0", vendor_tax_id="0105555000001")
     bot.handle(image_event())
     assert {v.name for v in bot.sheets.vendors()} == {"ร้านหมูอนามัย BETAGRO", "ร้านหมูอนามัย BETAGR0"}
 
@@ -381,7 +389,7 @@ def test_change_supplier_fixes_a_misread_name_and_learns_it():
     assert v.name == "ร้านหมูอนามัย BETAGRO" and "ร้านหมูอนามัย BETAGR0" in v.aliases
 
     # The same misreading on the next receipt now matches by itself.
-    bot.ocr.response = iapp_response(issuerName="ร้านหมูอนามัย BETAGR0", issuerTaxID="", invoiceID="INV2")
+    bot.ocr.response = receipt(vendor_name="ร้านหมูอนามัย BETAGR0", vendor_tax_id="", invoice_no="INV2")
     line.content = JPEG + b"next"
     bot.handle(image_event(msg_id="m2"))
     assert bot.sheets.rows[1]["category"] == "FOOD"
@@ -435,7 +443,7 @@ def test_change_price_cancel_and_other_people_are_ignored():
 
 
 def test_change_price_clears_total_warnings(monkeypatch):
-    bot, line = make_bot(ocr=FakeOcr(iapp_response(grandTotal="", vat="")))
+    bot, line = make_bot(ocr=FakeOcr(receipt(grand_total="", vat="")))
     bot.handle(image_event())
     assert bot.sheets.rows[0]["review_status"] == "needs_review"
     bot.handle(postback_event(button_data(last_reply(line), "Change price")))

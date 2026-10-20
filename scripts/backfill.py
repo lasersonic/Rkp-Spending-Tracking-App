@@ -2,7 +2,7 @@
 
 1. Telegram Desktop -> chat -> ⋮ -> Export chat history: tick Photos and Files,
    format "Machine-readable JSON". You get a folder with result.json.
-2. Estimate the cost first:
+2. Count the pages first (Google Vision reads 1,000 a month free):
        python -m scripts.backfill import ./ChatExport_2026-10-17 --dry-run
 3. Import (uses the same env vars as the bot):
        python -m scripts.backfill import ./ChatExport_2026-10-17
@@ -21,11 +21,11 @@ from pathlib import Path
 
 from app.categorize import Vendor, find_vendor, vendor_key
 from app.config import get_settings
-from app.iapp import IappClient
 from app.pipeline import Bot, detect_type, pdf_page_count
 from app.storage import DriveStore, SheetStore
+from app.vision import VisionClient
 
-COST_PER_PAGE = 1.34  # ฿, 1.25 + VAT
+FREE_PAGES_PER_MONTH = 1000  # Vision text detection; then about US$1.50 per 1,000
 
 
 class _QuietLine:
@@ -60,7 +60,7 @@ def make_bot() -> Bot:
         line=_QuietLine(),
         sheets=sheets,
         drive=DriveStore.from_settings(s.google_sa_info, s.google_drive_token_info, s.drive_folder_id),
-        ocr=IappClient(s.iapp_api_key, s.iapp_url),
+        ocr=VisionClient(s.google_sa_info),
     )
 
 
@@ -74,7 +74,10 @@ def cmd_import(args) -> int:
         kind = detect_type(content)
         if kind:
             pages += pdf_page_count(content) if kind[1] == "pdf" else 1
-    print(f"{len(files)} files, ~{pages} pages, est. OCR cost ~{pages * COST_PER_PAGE:.0f} ฿")
+    print(f"{len(files)} files, ~{pages} pages")
+    if pages > FREE_PAGES_PER_MONTH:
+        print(f"That's more than the {FREE_PAGES_PER_MONTH} pages Google Vision reads free each month "
+              f"(the bot's own receipts count too). Use --limit to spread the import over several months.")
     if args.dry_run:
         return 0
 
@@ -128,7 +131,7 @@ def main(argv=None) -> int:
     sub = p.add_subparsers(dest="cmd", required=True)
     imp = sub.add_parser("import", help="import a Telegram Desktop export")
     imp.add_argument("export_dir")
-    imp.add_argument("--dry-run", action="store_true", help="count files and estimate cost only")
+    imp.add_argument("--dry-run", action="store_true", help="count files and pages only")
     imp.add_argument("--limit", type=int, default=0, help="only the first N files (for a trial run)")
     imp.set_defaults(fn=cmd_import)
     sub.add_parser("apply-categories", help="fill receipt categories from the Vendors tab").set_defaults(

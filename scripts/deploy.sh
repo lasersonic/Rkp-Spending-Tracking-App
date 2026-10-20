@@ -19,7 +19,7 @@ while IFS= read -r line || [ -n "$line" ]; do
 done < .env
 
 need() { [ -n "${ENV[$1]:-}" ] || { echo "Missing $1 in .env" >&2; exit 1; }; }
-for k in LINE_CHANNEL_SECRET LINE_CHANNEL_ACCESS_TOKEN IAPP_API_KEY GOOGLE_SA_JSON GOOGLE_DRIVE_TOKEN_JSON SHEET_ID DRIVE_FOLDER_ID; do need "$k"; done
+for k in LINE_CHANNEL_SECRET LINE_CHANNEL_ACCESS_TOKEN GOOGLE_SA_JSON GOOGLE_DRIVE_TOKEN_JSON SHEET_ID DRIVE_FOLDER_ID; do need "$k"; done
 SA_FILE="${ENV[GOOGLE_SA_JSON]}"
 TOKEN_FILE="${ENV[GOOGLE_DRIVE_TOKEN_JSON]}"
 [ -f "$SA_FILE" ] || { echo "Missing $SA_FILE" >&2; exit 1; }
@@ -33,7 +33,7 @@ gcloud config set project "$PROJECT" --quiet
 
 echo "==> Enabling APIs (first time takes a minute)"
 gcloud services enable run.googleapis.com cloudbuild.googleapis.com artifactregistry.googleapis.com \
-  secretmanager.googleapis.com sheets.googleapis.com drive.googleapis.com --quiet
+  secretmanager.googleapis.com sheets.googleapis.com drive.googleapis.com vision.googleapis.com --quiet
 
 NUMBER="$(gcloud projects describe "$PROJECT" --format='value(projectNumber)')"
 RUNTIME_SA="${NUMBER}-compute@developer.gserviceaccount.com"
@@ -49,7 +49,7 @@ put_secret() {  # name, then the value on stdin
   echo "    $1"
 }
 echo "==> Storing secrets in Secret Manager"
-for k in LINE_CHANNEL_SECRET LINE_CHANNEL_ACCESS_TOKEN IAPP_API_KEY; do printf '%s' "${ENV[$k]}" | put_secret "$k"; done
+for k in LINE_CHANNEL_SECRET LINE_CHANNEL_ACCESS_TOKEN; do printf '%s' "${ENV[$k]}" | put_secret "$k"; done
 put_secret GOOGLE_SA_JSON < "$SA_FILE"
 put_secret GOOGLE_DRIVE_TOKEN_JSON < "$TOKEN_FILE"
 
@@ -69,7 +69,7 @@ gcloud run deploy "$SERVICE" --source . --region "$REGION" --quiet \
   --allow-unauthenticated --min-instances 0 --max-instances 1 --no-cpu-throttling \
   --memory 512Mi --timeout 300 \
   --env-vars-file "$ENV_FILE" \
-  --set-secrets "LINE_CHANNEL_SECRET=LINE_CHANNEL_SECRET:latest,LINE_CHANNEL_ACCESS_TOKEN=LINE_CHANNEL_ACCESS_TOKEN:latest,IAPP_API_KEY=IAPP_API_KEY:latest,GOOGLE_SA_JSON=GOOGLE_SA_JSON:latest,GOOGLE_DRIVE_TOKEN_JSON=GOOGLE_DRIVE_TOKEN_JSON:latest"
+  --set-secrets "LINE_CHANNEL_SECRET=LINE_CHANNEL_SECRET:latest,LINE_CHANNEL_ACCESS_TOKEN=LINE_CHANNEL_ACCESS_TOKEN:latest,GOOGLE_SA_JSON=GOOGLE_SA_JSON:latest,GOOGLE_DRIVE_TOKEN_JSON=GOOGLE_DRIVE_TOKEN_JSON:latest"
 
 URL="$(gcloud run services describe "$SERVICE" --region "$REGION" --format='value(status.url)')"
 echo "==> Service is up: $URL"
