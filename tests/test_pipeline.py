@@ -11,13 +11,29 @@ from tests.fakes import JPEG, NOW, TOTAL, FakeDrive, FakeLine, FakeOcr, FakeShee
 
 OWNER = "Uowner"
 STAFF = "Ustaff"
+SHOPS = ["ร้านผักสมบัติโน๊ต", "ร้านไข่นายร้อย", "ร้านหมูอนามัย BETAGRO", "ร้านหมูเจ๊จิ๋ว", "ร้านกาญ กุ้งสด"]
+BETAGRO = "ร้านหมูอนามัย BETAGRO"
 
 
 def make_bot(ocr=None, drive=None, content=JPEG):
+    """The LINE bot as deployed: no OCR, people type the details."""
     settings = Settings(allowed_user_ids=frozenset({OWNER, STAFF}), owner_user_id=OWNER)
     line = FakeLine(content)
-    bot = Bot(settings, line, FakeSheets(), drive or FakeDrive(), ocr or FakeOcr(receipt()), now=lambda: NOW)
+    bot = Bot(settings, line, FakeSheets(), drive or FakeDrive(), ocr, now=lambda: NOW)
     return bot, line
+
+
+def shop_bot(**kw):
+    """Suppliers tab filled in; Betagro already has a category."""
+    bot, line = make_bot(**kw)
+    bot.sheets.supplier_names = list(SHOPS)
+    bot.sheets.save_vendor(Vendor(vendor_key("", BETAGRO), "", BETAGRO, category="FOOD"))
+    return bot, line
+
+
+def ocr_bot(**kw):
+    """The backfill's bot: reads receipts with OCR instead of asking."""
+    return make_bot(ocr=kw.pop("ocr", None) or FakeOcr(receipt()), **kw)
 
 
 def _base(user, reply_token="rt", group=None):
@@ -42,8 +58,8 @@ def sticker_event(user=STAFF, group=None):
                                                "stickerId": "1", "stickerResourceType": "STATIC"}})
 
 
-def postback_event(data, user=STAFF):
-    return PostbackEvent.from_dict({**_base(user), "type": "postback", "postback": {"data": data}})
+def postback_event(data, user=STAFF, group=None):
+    return PostbackEvent.from_dict({**_base(user, group=group), "type": "postback", "postback": {"data": data}})
 
 
 def last_reply(line) -> OutMessage:
@@ -52,6 +68,14 @@ def last_reply(line) -> OutMessage:
 
 def button_data(msg: OutMessage, label: str) -> str:
     return next(b.data for b in msg.buttons + msg.quick_replies if b.label == label)
+
+
+def tap(bot, line, label, **kw):
+    bot.handle(postback_event(button_data(last_reply(line), label), **kw))
+
+
+def labels(msg: OutMessage, quick=True) -> list[str]:
+    return [b.label for b in (msg.quick_replies if quick else msg.buttons)]
 
 
 # -- helpers ---------------------------------------------------------------------
@@ -70,144 +94,208 @@ def test_formatting():
     assert file_slug("Makro / Lat Phrao") == "Makro-Lat-Phrao"
 
 
-# -- the main flow -----------------------------------------------------------------
+# -- the LINE flow: photo -> supplier -> price -> saved ---------------------------
 
-def test_new_vendor_receipt_is_archived_logged_and_asks_for_category():
-    bot, line = make_bot()
+def test_photo_is_archived_and_asks_for_the_supplier():
+    bot, line = shop_bot()
     bot.handle(image_event())
 
     [row] = bot.sheets.rows
-    assert row["receipt_date"] == "2026-10-15"
-    assert row["grand_total"] == "1,240.00"
-    assert row["vat"] == "81.12"
-    assert row["net_before_vat"] == "1,158.88"
-    assert row["vendor_name"].startswith("บริษัท สยามแม็คโคร")
-    for dropped in ("vendor_tax_id", "vendor_phone", "vendor_address", "customer_name", "customer_tax_id",
-                    "submitted_by", "doc_type", "invoice_book", "po_no"):
-        assert dropped not in row
-    assert row["category"] == ""
-    assert row["review_status"] == "ok"
-    assert row["source"] == "line"
-    assert len(bot.sheets.items) == 2
-
+    rid = row["receipt_id"]
+    assert row["receipt_date"] == "2026-10-17" and row["source"] == "line"
+    assert row["review_status"] == "incomplete" and row["review_note"] == "waiting for supplier and price"
+    assert row["vendor_name"] == "" and row["grand_total"] == ""
     [f] = bot.drive.files.values()
-    assert f["folder"] == "2026/10"
-    assert f["name"] == "2026-10-15_บริษัท-สยามแม็คโคร-จำกัด-(มหาชน)_1240.00.jpg"
+    assert f["name"] == f"2026-10-17_{rid}.jpg" and f["folder"] == "2026/10"
 
-    to, msg, token = line.sent[-1]
-    assert (to, token) == (STAFF, "rt")
-    assert msg.text.startswith("฿1,240 · บริษัท สยามแม็คโคร")
-    assert "❓ category" in msg.text and "15/10" in msg.text
-    assert [b.label for b in msg.buttons] == ["Change category", "Change supplier", "Change price"]
-    assert "Food cost" in [b.label for b in msg.quick_replies]
+    msg = last_reply(line)
+    assert msg.text.startswith(f"📁 Saved to Drive ({rid}).") and "Which supplier?" in msg.text
+    assert labels(msg) == ["ร้านผักสมบัติโน๊ต", "ร้านไข่นายร้อย", "หมูอนามัย BETAGRO", "ร้านหมูเจ๊จิ๋ว",
+                           "ร้านกาญ กุ้งสด", "✏️ Type name"]
+    assert all(len(b.label) <= 20 and len(b.data) <= 300 for b in msg.quick_replies)
 
 
-def test_choosing_a_category_is_remembered_for_the_vendor():
-    bot, line = make_bot()
+def test_pick_supplier_then_type_price_saves_and_shows_the_result():
+    bot, line = shop_bot()
     bot.handle(image_event())
-    bot.handle(postback_event(button_data(last_reply(line), "Food cost")))
+    tap(bot, line, "หมูอนามัย BETAGRO")
+    assert last_reply(line).text.startswith(f"Supplier: {BETAGRO}\nType the total price for {BETAGRO}")
+    assert bot.sheets.rows[0]["review_note"] == "waiting for price"
 
+    bot.handle(text_event("1,250"))
+    row = bot.sheets.rows[0]
+    assert row["vendor_name"] == BETAGRO and row["category"] == "FOOD"
+    assert row["grand_total"] == "1,250.00" and row["net_before_vat"] == "1,250.00"
+    assert row["review_status"] == "ok" and row["review_note"] == ""
+    [f] = bot.drive.files.values()
+    assert f["name"] == "2026-10-17_ร้านหมูอนามัย-BETAGRO_1250.00.jpg"
+    assert next(v for v in bot.sheets.vendors() if v.name == BETAGRO).receipt_count == 1
+
+    msg = last_reply(line)
+    assert msg.text == f"Saved: ฿1,250 · {BETAGRO} · Food cost · 17/10 ✅"
+    assert labels(msg, quick=False) == ["Change price", "Change category", "Change supplier"]
+    assert not msg.quick_replies
+
+    sent = len(line.sent)
+    bot.handle(text_event("1300"))  # not asked any more: ordinary chat is ignored
+    assert len(line.sent) == sent
+
+
+def test_typed_new_supplier_then_price_then_category_is_remembered():
+    bot, line = shop_bot()
+    bot.handle(image_event())
+    tap(bot, line, "✏️ Type name")
+    assert last_reply(line).text.startswith("Type the supplier name.")
+    bot.handle(text_event("  ร้านป้าแดง  "))
+    assert "Type the total price for ร้านป้าแดง" in last_reply(line).text
+    bot.handle(text_event("300"))
+
+    msg = last_reply(line)
+    assert msg.text == "Saved: ฿300 · ร้านป้าแดง · ❓ category · 17/10\nNew supplier: pick a category below."
+    assert "Food cost" in labels(msg)
+    tap(bot, line, "Food cost")
+    assert last_reply(line).text == "Saved: ฿300 · ร้านป้าแดง · Food cost · 17/10 ✅"
     assert bot.sheets.rows[0]["category"] == "FOOD"
-    assert {i["category"] for i in bot.sheets.items} == {"FOOD"}
-    [vendor] = bot.sheets.vendor_rows.values()
-    assert vendor.tax_id == "0107537000521" and vendor.category == "FOOD"
-    assert "I'll remember" in last_reply(line).text
+    assert next(v for v in bot.sheets.vendors() if v.name == "ร้านป้าแดง").category == "FOOD"
 
-    # Next receipt from the same vendor is categorized automatically.
-    bot.ocr.response = receipt(invoice_no="INV0099999", vendor_name="SIAM MAKRO")
+    # Next time the typed name (any spacing/case) matches and is categorized by itself.
     line.content = JPEG + b"second"
     bot.handle(image_event(msg_id="m2"))
-    assert bot.sheets.rows[1]["category"] == "FOOD"
-    assert last_reply(line).text == "฿1,240 · SIAM MAKRO · Food cost · 15/10 ✅"
-    assert not last_reply(line).quick_replies
-    [vendor] = bot.sheets.vendor_rows.values()
-    assert vendor.receipt_count == 2 and "SIAM MAKRO" in vendor.aliases
+    tap(bot, line, "✏️ Type name")
+    bot.handle(text_event("ร้านป้าแดง"))
+    bot.handle(text_event("120"))
+    assert last_reply(line).text == "Saved: ฿120 · ร้านป้าแดง · Food cost · 17/10 ✅"
 
 
-def test_change_category_button():
+def test_in_a_1to1_chat_the_name_can_be_typed_without_the_button():
+    bot, line = shop_bot()
+    bot.handle(image_event())
+    bot.handle(text_event("Makro"))
+    assert "Type the total price for Makro" in last_reply(line).text
+
+
+def test_in_a_group_chat_needs_the_button_before_typing_a_name():
+    bot, line = shop_bot()
+    bot.handle(image_event(group="Cgroup"))
+    assert line.sent[-1][0] == "Cgroup"
+    sent = len(line.sent)
+    bot.handle(text_event("ok thanks", group="Cgroup"))  # ordinary chat isn't taken as a name
+    assert len(line.sent) == sent and bot.sheets.rows[0]["vendor_name"] == ""
+    tap(bot, line, "✏️ Type name", group="Cgroup")
+    bot.handle(text_event("Makro", group="Cgroup"))
+    bot.handle(text_event("99", group="Cgroup"))
+    assert bot.sheets.rows[0]["vendor_name"] == "Makro" and bot.sheets.rows[0]["grand_total"] == "99.00"
+    assert line.sent[-1][0] == "Cgroup"
+
+
+def test_no_suppliers_on_the_tab_asks_to_type_the_name():
     bot, line = make_bot()
     bot.handle(image_event())
-    summary = last_reply(line)
-
-    bot.handle(postback_event(button_data(summary, "Change category")))
-    assert len(last_reply(line).quick_replies) == 11
-    bot.handle(postback_event(button_data(last_reply(line), "Rent")))
-    assert bot.sheets.rows[0]["category"] == "RENT"
+    msg = last_reply(line)
+    assert msg.text.endswith("Type the supplier name.") and labels(msg) == ["✏️ Type name"]
+    bot.handle(text_event("Makro"))
+    assert bot.sheets.rows[0]["vendor_name"] == "Makro"
 
 
-def test_old_ok_and_flag_buttons_still_work():
-    bot, line = make_bot()
+def test_bad_answers_are_asked_again_and_cancel_stops():
+    bot, line = shop_bot()
     bot.handle(image_event())
-    rid = bot.sheets.rows[0]["receipt_id"]
-    bot.handle(postback_event(f"a=flag&r={rid}"))
-    assert bot.sheets.rows[0]["review_status"] == "flagged"
-    bot.handle(postback_event(f"a=ok&r={rid}"))
-    assert bot.sheets.rows[0]["review_status"] == "confirmed"
+    tap(bot, line, "✏️ Type name")
+    bot.handle(text_event("1250"))  # a number isn't a supplier name
+    assert "Type the supplier's name" in last_reply(line).text
+    bot.handle(text_event("Makro"))
+    bot.handle(text_event("twelve fifty"))
+    assert "isn't a price" in last_reply(line).text
+    bot.handle(text_event("summary"))  # commands still work while waiting
+    assert "No receipts logged" in last_reply(line).text
+    bot.handle(text_event("cancel"))
+    assert "stopped" in last_reply(line).text
+    bot.handle(text_event("1250"))
+    assert bot.sheets.rows[0]["grand_total"] == ""
+    assert bot.sheets.rows[0]["review_status"] == "incomplete"
 
 
-def test_validation_problems_set_review_flag():
-    bot, line = make_bot(ocr=FakeOcr(receipt(vat="10.00")))
+def test_other_people_cannot_answer_for_you():
+    bot, line = shop_bot()
     bot.handle(image_event())
+    tap(bot, line, "หมูอนามัย BETAGRO")
+    bot.handle(text_event("999", user=OWNER))
+    assert bot.sheets.rows[0]["grand_total"] == ""
+    bot.handle(text_event("50"))
+    assert bot.sheets.rows[0]["grand_total"] == "50.00"
+
+
+def test_after_the_wait_expires_buttons_still_work(monkeypatch):
+    bot, line = shop_bot()
+    bot.handle(image_event())
+    first = last_reply(line)
+    import app.pipeline as pipeline
+    real = pipeline.time.monotonic
+    monkeypatch.setattr(pipeline.time, "monotonic", lambda: real() + pipeline.WAIT_SECONDS + 1)
+    sent = len(line.sent)
+    bot.handle(text_event("Makro"))  # too late to count as the answer
+    assert len(line.sent) == sent
+    bot.handle(postback_event(button_data(first, "หมูอนามัย BETAGRO")))  # the chips on the old message work
+    bot.handle(text_event("75"))
+    assert bot.sheets.rows[0]["grand_total"] == "75.00"
+
+
+def complete_bot():
+    bot, line = shop_bot()
+    bot.handle(image_event())
+    tap(bot, line, "หมูอนามัย BETAGRO")
+    bot.handle(text_event("1250"))
+    return bot, line
+
+
+def test_change_price_from_the_result():
+    bot, line = complete_bot()
+    tap(bot, line, "Change price")
+    assert last_reply(line).text.startswith(f"Type the correct total for {BETAGRO} (now ฿1,250)")
+    bot.handle(text_event("฿1,300.50"))
     row = bot.sheets.rows[0]
-    assert row["review_status"] == "needs_review"
-    assert "VAT" in row["review_note"]
-    assert "⚠️" in last_reply(line).text
+    assert row["grand_total"] == "1,300.50" and row["review_status"] == "ok"
+    assert row["review_note"] == "total edited by hand (was ฿1,250)"
+    assert last_reply(line).text == f"Saved: ฿1,300.50 · {BETAGRO} · Food cost · 17/10 ✅"
+    [f] = bot.drive.files.values()
+    assert f["name"].endswith("_1300.50.jpg")
+
+
+def test_change_category_from_the_result():
+    bot, line = complete_bot()
+    tap(bot, line, "Change category")
+    assert len(last_reply(line).quick_replies) == 11
+    tap(bot, line, "Rent")
+    assert bot.sheets.rows[0]["category"] == "RENT"
+    assert last_reply(line).text == f"Saved: ฿1,250 · {BETAGRO} · Rent · 17/10 ✅"
+
+
+def test_change_supplier_from_the_result_keeps_the_price():
+    bot, line = complete_bot()
+    tap(bot, line, "Change supplier")
+    assert "✏️ Type name" in labels(last_reply(line))
+    tap(bot, line, "ร้านไข่นายร้อย")
+    row = bot.sheets.rows[0]
+    assert row["vendor_name"] == "ร้านไข่นายร้อย" and row["grand_total"] == "1,250.00"
+    # The new shop has no category yet, so the receipt keeps the one it had.
+    assert last_reply(line).text == "Saved: ฿1,250 · ร้านไข่นายร้อย · Food cost · 17/10 ✅"
+    betagro = next(v for v in bot.sheets.vendors() if v.name == BETAGRO)
+    assert "ร้านไข่นายร้อย" not in betagro.aliases and BETAGRO not in next(
+        v for v in bot.sheets.vendors() if v.name == "ร้านไข่นายร้อย").aliases  # a wrong tap isn't a misreading
 
 
 def test_same_file_twice_is_skipped():
-    bot, line = make_bot()
+    bot, line = shop_bot()
     bot.handle(image_event())
     bot.handle(image_event(msg_id="m2"))
     assert len(bot.sheets.rows) == 1 and len(bot.drive.files) == 1
     assert "Already logged" in last_reply(line).text
-    assert bot.ocr.calls == 1
 
 
-def test_same_invoice_different_photo_is_skipped():
-    bot, line = make_bot()
+def test_heic_and_large_files_are_simply_archived():
+    bot, line = shop_bot(content=b"\x00\x00\x00\x18ftypheic....")
     bot.handle(image_event())
-    line.content = JPEG + b"another photo of the same bill"
-    bot.handle(image_event(msg_id="m2"))
-    assert len(bot.sheets.rows) == 1
-    assert [f["trashed"] for f in bot.drive.files.values()] == [False, True]
-    assert "already logged" in last_reply(line).text
-
-
-def test_vendor_without_tax_id_learns_it():
-    bot, line = make_bot()
-    bot.sheets.save_vendor(Vendor("name:makro", "", "บริษัท สยามแม็คโคร จำกัด (มหาชน)", category="FOOD"))
-    bot.handle(image_event())
-    [v] = bot.sheets.vendors()
-    assert v.tax_id == "0107537000521" and v.receipt_count == 1
-    assert bot.sheets.rows[0]["category"] == "FOOD"
-
-
-def test_out_of_credits_keeps_file_and_alerts_owner_then_retry_works():
-    ocr = FakeOcr(error=OcrAuthError("Vision API returned 403: billing is disabled"))
-    bot, line = make_bot(ocr=ocr)
-    bot.handle(image_event())
-
-    [row] = bot.sheets.rows
-    assert row["review_status"] == "pending_ocr"
-    assert len(bot.drive.files) == 1
-    assert any(to == OWNER and "403" in m.text for to, m, _ in line.sent)
-    assert "/retry" in last_reply(line).text
-
-    ocr.error = None
-    ocr.response = receipt()
-    bot.handle(text_event("/retry"))
-    assert "1 logged" in last_reply(line).text
-    row = bot.sheets.rows[0]
-    assert row["review_status"] == "ok" and row["grand_total"] == "1,240.00"
-    assert len(bot.sheets.items) == 2
-    assert next(iter(bot.drive.files.values()))["name"].startswith("2026-10-15_")
-
-
-def test_transient_ocr_failure_is_pending():
-    bot, line = make_bot(ocr=FakeOcr(error=OcrError("Vision API returned 503")))
-    bot.handle(image_event())
-    assert bot.sheets.rows[0]["review_status"] == "pending_ocr"
-    assert not any(to == OWNER for to, _, _ in line.sent)  # only auth errors alert the owner
+    assert len(bot.drive.files) == 1 and "Which supplier?" in last_reply(line).text
 
 
 def test_drive_failure_tells_user_and_owner():
@@ -225,24 +313,6 @@ def test_unsupported_file_type():
     assert bot.drive.files == {}
 
 
-def test_pdf_over_page_limit_is_archived_for_manual_entry():
-    pdf = b"%PDF-1.4 " + b"/Type /Page " * 11
-    bot, line = make_bot(content=pdf)
-    bot.handle(image_event())
-    assert bot.ocr.calls == 0
-    assert len(bot.drive.files) == 1
-    assert bot.sheets.rows[0]["review_status"] == "needs_review"
-    assert "11 pages" in last_reply(line).text
-
-
-def test_heic_is_archived_but_not_sent_to_ocr():
-    bot, line = make_bot(content=b"\x00\x00\x00\x18ftypheic....")
-    bot.handle(image_event())
-    assert bot.ocr.calls == 0
-    assert len(bot.drive.files) == 1 and bot.sheets.rows[0]["review_status"] == "needs_review"
-    assert "send it as a normal photo" in last_reply(line).text
-
-
 def test_stranger_is_rejected_with_their_id():
     bot, line = make_bot()
     bot.handle(image_event(user="Ustranger"))
@@ -251,33 +321,40 @@ def test_stranger_is_rejected_with_their_id():
 
 
 def test_month_summary_and_help():
-    bot, line = make_bot()
-    bot.handle(image_event())
-    bot.handle(postback_event(button_data(last_reply(line), "Food cost")))
+    bot, line = complete_bot()
     bot.handle(text_event("Summary"))
     text = last_reply(line).text
-    assert "10/2026" in text and "Food cost: ฿1,240" in text and "Total: ฿1,240" in text
+    assert "10/2026" in text and "Food cost: ฿1,250" in text and "Total: ฿1,250" in text
 
     bot.handle(text_event("help"))
-    assert "Forward a receipt" in last_reply(line).text
+    assert "ask for the supplier and the price" in last_reply(line).text
+    assert "/retry" not in last_reply(line).text
+    sent = len(line.sent)
+    bot.handle(text_event("/retry"))  # only the OCR backfill has anything to retry
+    assert len(line.sent) == sent
 
 
 def test_daily_lists_receipts_logged_today():
-    bot, line = make_bot()
+    bot, line = shop_bot()
     bot.handle(text_event("daily"))
     assert last_reply(line).text == "No receipts logged today (17/10) yet."
 
     bot.handle(image_event())
-    bot.handle(postback_event(button_data(last_reply(line), "Food cost")))
-    # Logged yesterday (even though dated today) and a pending one from today.
+    tap(bot, line, "หมูอนามัย BETAGRO")
+    bot.handle(text_event("1240"))
+    line.content = JPEG + b"second"
+    bot.handle(image_event(msg_id="m2"))  # not answered yet
+    # Logged yesterday (even though dated today) and a pending OCR one from today.
     bot.sheets.rows.append({"receipt_id": "R261016-aaaaaa", "received_at": "2026-10-16 09:00:00",
                             "receipt_date": "2026-10-17", "grand_total": "99.00", "review_status": "ok"})
     bot.sheets.rows.append({"receipt_id": "R261017-bbbbbb", "received_at": "2026-10-17 15:00:00",
                             "review_status": "pending_ocr"})
     bot.handle(text_event("/Daily"))
+    rid2 = bot.sheets.rows[1]["receipt_id"]
     assert last_reply(line).text.splitlines() == [
-        "🧾 Today 17/10 (2 receipts)",
-        "• ฿1,240 · บริษัท สยามแม็คโคร จำกัด (มหาชน) · Food cost ✅",
+        "🧾 Today 17/10 (3 receipts)",
+        f"• ฿1,240 · {BETAGRO} · Food cost ✅",
+        f"• ⏳ {rid2} · waiting for supplier and price",
         "• ⏳ R261017-bbbbbb · waiting for OCR",
         "Total: ฿1,240",
     ]
@@ -309,155 +386,148 @@ def test_other_messages_are_ignored():
     assert line.sent == []
 
 
-def test_group_chat_receipt_and_commands_reply_to_group():
-    bot, line = make_bot()
-    bot.handle(image_event(group="Cgroup"))
-    assert bot.sheets.rows and line.sent[-1][0] == "Cgroup"
+def test_group_chat_commands_reply_to_group_and_strangers_are_ignored():
+    bot, line = complete_bot()
     bot.handle(text_event("summary", group="Cgroup"))
     assert line.sent[-1][0] == "Cgroup" and "Total:" in last_reply(line).text
     sent = len(line.sent)
     bot.handle(text_event("hi", user="Ustranger", group="Cgroup"))
-    assert len(line.sent) == sent  # strangers are ignored in groups
+    assert len(line.sent) == sent
 
 
 def test_postback_payload_fits_line_limit():
-    bot, line = make_bot()
-    bot.handle(image_event())
+    bot, line = complete_bot()
     for b in last_reply(line).buttons + last_reply(line).quick_replies:
         assert len(b.data) <= 300 and len(b.label) <= 20
         assert parse_qs(b.data)["r"] == [bot.sheets.rows[0]["receipt_id"]]
 
 
-SHOPS = ["ร้านผักสมบัติโน๊ต", "ร้านไข่นายร้อย", "ร้านหมูอนามัย BETAGRO", "ร้านหมูเจ๊จิ๋ว", "ร้านกาญ กุ้งสด"]
+def test_old_ok_and_flag_buttons_still_work():
+    bot, line = complete_bot()
+    rid = bot.sheets.rows[0]["receipt_id"]
+    bot.handle(postback_event(f"a=flag&r={rid}"))
+    assert bot.sheets.rows[0]["review_status"] == "flagged"
+    bot.handle(postback_event(f"a=ok&r={rid}"))
+    assert bot.sheets.rows[0]["review_status"] == "confirmed"
 
 
-def bot_with_shops(**ocr_fields):
-    bot, line = make_bot(ocr=FakeOcr(receipt(**{"vendor_name": "", "vendor_tax_id": "", **ocr_fields})))
-    bot.sheets.supplier_names = list(SHOPS)
-    betagro = "ร้านหมูอนามัย BETAGRO"
-    bot.sheets.save_vendor(Vendor(vendor_key("", betagro), "", betagro, category="FOOD"))
-    return bot, line
+# -- the backfill's OCR flow ----------------------------------------------------------
+
+def ocr_file(bot, content=JPEG):
+    return bot.process_file(content, "r.jpg", submitted_by="telegram:x", source="telegram_backfill")
 
 
-def test_unknown_vendor_asks_which_shop():
-    bot, line = bot_with_shops()
-    bot.handle(image_event())
-    msg = last_reply(line)
-    assert "Which shop is this?" in msg.text
-    labels = [b.label for b in msg.quick_replies]
-    assert "หมูอนามัย BETAGRO" in labels and "ร้านผักสมบัติโน๊ต" in labels and len(labels) == 5
-    assert all(len(b.label) <= 20 and len(b.data) <= 300 for b in msg.quick_replies)
-    assert bot.sheets.rows[0]["review_status"] == "needs_review"
+def test_ocr_receipt_is_archived_logged_and_asks_for_category():
+    bot, line = ocr_bot()
+    out = ocr_file(bot)
 
+    [row] = bot.sheets.rows
+    assert row["receipt_date"] == "2026-10-15"
+    assert row["grand_total"] == "1,240.00"
+    assert row["vat"] == "81.12"
+    assert row["net_before_vat"] == "1,158.88"
+    assert row["vendor_name"].startswith("บริษัท สยามแม็คโคร")
+    for dropped in ("vendor_tax_id", "vendor_phone", "vendor_address", "customer_name", "customer_tax_id",
+                    "submitted_by", "doc_type", "invoice_book", "po_no"):
+        assert dropped not in row
+    assert row["category"] == "" and row["review_status"] == "ok"
+    assert len(bot.sheets.items) == 2
 
-def test_picking_a_shop_with_a_category_fills_the_row():
-    bot, line = bot_with_shops()
-    bot.handle(image_event())
-    bot.handle(postback_event(button_data(last_reply(line), "หมูอนามัย BETAGRO")))
-    row = bot.sheets.rows[0]
-    assert row["vendor_name"] == "ร้านหมูอนามัย BETAGRO" and row["category"] == "FOOD"
-    assert row["review_status"] == "ok" and row["review_note"] == ""
-    assert {i["category"] for i in bot.sheets.items} == {"FOOD"}
     [f] = bot.drive.files.values()
-    assert f["name"].startswith("2026-10-15_ร้านหมูอนามัย-BETAGRO_") and f["name"].endswith(".jpg")
-    assert "✅ ร้านหมูอนามัย BETAGRO" in last_reply(line).text
-    assert next(v for v in bot.sheets.vendors() if "BETAGRO" in v.name).receipt_count == 1
+    assert f["folder"] == "2026/10"
+    assert f["name"] == "2026-10-15_บริษัท-สยามแม็คโคร-จำกัด-(มหาชน)_1240.00.jpg"
+    assert out.status == "logged" and out.needs_category
+    assert out.message.text.startswith("฿1,240 · บริษัท สยามแม็คโคร")
 
 
-def test_picking_a_shop_without_a_category_then_asks_for_one():
-    bot, line = bot_with_shops()
-    bot.handle(image_event())
-    bot.handle(postback_event(button_data(last_reply(line), "ร้านไข่นายร้อย")))
-    assert "pick a category" in last_reply(line).text
-    bot.handle(postback_event(button_data(last_reply(line), "Food cost")))
+def test_ocr_category_is_remembered_for_the_vendor():
+    bot, line = ocr_bot()
+    rid = ocr_file(bot).receipt_id
+    bot.handle(postback_event(f"a=cat&r={rid}&c=FOOD"))
     assert bot.sheets.rows[0]["category"] == "FOOD"
-    assert next(v for v in bot.sheets.vendors() if v.name == "ร้านไข่นายร้อย").category == "FOOD"
+    assert {i["category"] for i in bot.sheets.items} == {"FOOD"}
+    [vendor] = bot.sheets.vendor_rows.values()
+    assert vendor.tax_id == "0107537000521" and vendor.category == "FOOD"
 
-
-def test_change_supplier_fixes_a_misread_name_and_learns_it():
-    bot, line = bot_with_shops(vendor_name="ร้านหมูอนามัย BETAGR0", vendor_tax_id="0105555000001")
-    bot.handle(image_event())
-    assert {v.name for v in bot.sheets.vendors()} == {"ร้านหมูอนามัย BETAGRO", "ร้านหมูอนามัย BETAGR0"}
-
-    bot.handle(postback_event(button_data(last_reply(line), "Change supplier")))
-    assert [b.label for b in last_reply(line).quick_replies][2] == "หมูอนามัย BETAGRO"
-    bot.handle(postback_event(button_data(last_reply(line), "หมูอนามัย BETAGRO")))
-
-    row = bot.sheets.rows[0]
-    assert row["vendor_name"] == "ร้านหมูอนามัย BETAGRO" and row["category"] == "FOOD"
-    [v] = bot.sheets.vendors()  # the entry made from the misreading is gone
-    assert v.name == "ร้านหมูอนามัย BETAGRO" and "ร้านหมูอนามัย BETAGR0" in v.aliases
-
-    # The same misreading on the next receipt now matches by itself.
-    bot.ocr.response = receipt(vendor_name="ร้านหมูอนามัย BETAGR0", vendor_tax_id="", invoice_no="INV2")
-    line.content = JPEG + b"next"
-    bot.handle(image_event(msg_id="m2"))
+    bot.ocr.response = receipt(invoice_no="INV0099999", vendor_name="SIAM MAKRO")
+    out = ocr_file(bot, JPEG + b"second")
     assert bot.sheets.rows[1]["category"] == "FOOD"
+    assert out.message.text == "฿1,240 · SIAM MAKRO · Food cost · 15/10 ✅"
+    [vendor] = bot.sheets.vendor_rows.values()
+    assert vendor.receipt_count == 2 and "SIAM MAKRO" in vendor.aliases
 
 
-def test_change_supplier_with_empty_list_says_so():
-    bot, line = make_bot()
-    bot.handle(image_event())
-    bot.handle(postback_event(button_data(last_reply(line), "Change supplier")))
-    assert "Suppliers tab" in last_reply(line).text
+def test_ocr_validation_problems_set_review_flag():
+    bot, line = ocr_bot(ocr=FakeOcr(receipt(vat="10.00")))
+    out = ocr_file(bot)
+    row = bot.sheets.rows[0]
+    assert row["review_status"] == "needs_review" and "VAT" in row["review_note"]
+    assert "⚠️" in out.message.text
 
 
-def price_bot():
-    bot, line = make_bot()
-    bot.handle(image_event())
-    bot.handle(postback_event(button_data(last_reply(line), "Change price")))
-    return bot, line
+def test_ocr_same_invoice_different_photo_is_skipped():
+    bot, line = ocr_bot()
+    ocr_file(bot)
+    out = ocr_file(bot, JPEG + b"another photo of the same bill")
+    assert len(bot.sheets.rows) == 1 and out.status == "duplicate"
+    assert [f["trashed"] for f in bot.drive.files.values()] == [False, True]
 
 
-def test_change_price_asks_then_takes_the_next_message():
-    bot, line = price_bot()
-    assert last_reply(line).text.startswith("Type the correct total for บริษัท สยามแม็คโคร")
-    assert "(now ฿1,240)" in last_reply(line).text
+def test_ocr_vendor_without_tax_id_learns_it():
+    bot, line = ocr_bot()
+    bot.sheets.save_vendor(Vendor("name:makro", "", "บริษัท สยามแม็คโคร จำกัด (มหาชน)", category="FOOD"))
+    ocr_file(bot)
+    [v] = bot.sheets.vendors()
+    assert v.tax_id == "0107537000521" and v.receipt_count == 1
+    assert bot.sheets.rows[0]["category"] == "FOOD"
 
-    bot.handle(text_event("twelve fifty"))
-    assert "isn't a price" in last_reply(line).text
-    bot.handle(text_event("1,250"))
-    assert "total changed from ฿1,240 to ฿1,250" in last_reply(line).text
+
+def test_ocr_auth_error_keeps_file_and_alerts_owner_then_retry_works():
+    ocr = FakeOcr(error=OcrAuthError("Vision API returned 403: billing is disabled"))
+    bot, line = ocr_bot(ocr=ocr)
+    out = ocr_file(bot)
+    assert bot.sheets.rows[0]["review_status"] == "pending_ocr" and len(bot.drive.files) == 1
+    assert any(to == OWNER and "403" in m.text for to, m, _ in line.sent)
+    assert "/retry" in out.message.text
+
+    ocr.error = None
+    ocr.response = receipt()
+    bot.handle(text_event("/retry"))
+    assert "1 logged" in last_reply(line).text
+    row = bot.sheets.rows[0]
+    assert row["review_status"] == "ok" and row["grand_total"] == "1,240.00"
+    assert next(iter(bot.drive.files.values()))["name"].startswith("2026-10-15_")
+
+
+def test_ocr_transient_failure_is_pending():
+    bot, line = ocr_bot(ocr=FakeOcr(error=OcrError("Vision API returned 503")))
+    ocr_file(bot)
+    assert bot.sheets.rows[0]["review_status"] == "pending_ocr"
+    assert not any(to == OWNER for to, _, _ in line.sent)  # only auth errors alert the owner
+
+
+def test_ocr_limits_archive_for_manual_entry():
+    bot, line = ocr_bot()
+    ocr_file(bot, b"%PDF-1.4 " + b"/Type /Page " * 11)
+    ocr_file(bot, b"\x00\x00\x00\x18ftypheic....")
+    assert bot.ocr.calls == 0 and len(bot.drive.files) == 2
+    assert [r["review_status"] for r in bot.sheets.rows] == ["needs_review", "needs_review"]
+
+
+def test_ocr_misread_supplier_is_fixed_and_learned():
+    bot, line = ocr_bot(ocr=FakeOcr(receipt(vendor_name="ร้านหมูอนามัย BETAGR0", vendor_tax_id="0105555000001")))
+    bot.sheets.supplier_names = list(SHOPS)
+    bot.sheets.save_vendor(Vendor(vendor_key("", BETAGRO), "", BETAGRO, category="FOOD"))
+    rid = ocr_file(bot).receipt_id
+    bot.handle(postback_event(f"a=chven&r={rid}"))
+    tap(bot, line, "หมูอนามัย BETAGRO")
 
     row = bot.sheets.rows[0]
-    assert row["grand_total"] == "1,250.00" and row["net_before_vat"] == "1,168.88"  # VAT 81.12 kept
-    assert "total edited by hand (was ฿1,240)" in row["review_note"]
-    [f] = bot.drive.files.values()
-    assert f["name"].endswith("_1250.00.jpg")
+    assert row["vendor_name"] == BETAGRO and row["category"] == "FOOD"
+    assert last_reply(line).text.startswith(f"Saved: ฿1,240 · {BETAGRO} · Food cost")
+    [v] = bot.sheets.vendors()  # the entry made from the misreading is gone
+    assert v.name == BETAGRO and "ร้านหมูอนามัย BETAGR0" in v.aliases
 
-    sent = len(line.sent)
-    bot.handle(text_event("1300"))  # no longer waiting: ignored
-    assert len(line.sent) == sent
-
-
-def test_change_price_cancel_and_other_people_are_ignored():
-    bot, line = price_bot()
-    bot.handle(text_event("999", user=OWNER))  # someone else: not their question
-    assert bot.sheets.rows[0]["grand_total"] == "1,240.00"
-    bot.handle(text_event("summary"))  # commands still work while waiting
-    assert "Total:" in last_reply(line).text
-    bot.handle(text_event("cancel"))
-    assert "wasn't changed" in last_reply(line).text
-    bot.handle(text_event("1250"))
-    assert bot.sheets.rows[0]["grand_total"] == "1,240.00"
-
-
-def test_change_price_clears_total_warnings(monkeypatch):
-    bot, line = make_bot(ocr=FakeOcr(receipt(grand_total="", vat="")))
-    bot.handle(image_event())
-    assert bot.sheets.rows[0]["review_status"] == "needs_review"
-    bot.handle(postback_event(button_data(last_reply(line), "Change price")))
-    assert "(no total yet)" in last_reply(line).text
-    bot.handle(text_event("฿1,240"))
-    row = bot.sheets.rows[0]
-    assert row["review_status"] == "ok" and row["review_note"] == "total edited by hand (was ฿?)"
-
-
-def test_change_price_wait_expires(monkeypatch):
-    bot, line = price_bot()
-    import app.pipeline as pipeline
-    real = pipeline.time.monotonic
-    monkeypatch.setattr(pipeline.time, "monotonic", lambda: real() + pipeline.PRICE_WAIT_SECONDS + 1)
-    sent = len(line.sent)
-    bot.handle(text_event("1250"))
-    assert len(line.sent) == sent and bot.sheets.rows[0]["grand_total"] == "1,240.00"
+    bot.ocr.response = receipt(vendor_name="ร้านหมูอนามัย BETAGR0", vendor_tax_id="", invoice_no="INV2")
+    ocr_file(bot, JPEG + b"next")
+    assert bot.sheets.rows[1]["category"] == "FOOD"

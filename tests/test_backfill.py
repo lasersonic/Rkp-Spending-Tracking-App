@@ -2,7 +2,7 @@ import json
 
 from scripts import backfill
 from tests.fakes import JPEG
-from tests.test_pipeline import make_bot
+from tests.test_pipeline import ocr_bot
 
 
 def make_export(tmp_path):
@@ -29,7 +29,7 @@ def test_reads_telegram_export(tmp_path):
 
 def test_import_dedupes_and_queues_vendor_categories(tmp_path, monkeypatch, capsys):
     make_export(tmp_path)
-    bot, _ = make_bot()
+    bot, _ = ocr_bot()
     monkeypatch.setattr(backfill, "make_bot", lambda: bot)
 
     backfill.main(["import", str(tmp_path)])

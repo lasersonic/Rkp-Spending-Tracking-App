@@ -1,8 +1,15 @@
 """The receipt pipeline and the bot's conversation logic.
 
-download -> dedupe (hash) -> archive in Drive -> OCR -> normalize/validate
--> dedupe (tax ID + invoice no.) -> categorize -> rename in Drive
--> write Sheets rows -> reply in LINE
+In LINE (no OCR):
+download -> dedupe (hash) -> archive in Drive -> Sheets row (incomplete)
+-> ask the supplier (Suppliers tab chips, or typed) -> ask the price
+-> save, rename in Drive -> reply with the result and Change price /
+Change category / Change supplier buttons
+
+The one-time Telegram backfill has no one to ask, so a Bot built with an
+`ocr` client reads each file instead:
+download -> dedupe -> archive -> OCR -> validate -> dedupe (invoice no.)
+-> categorize -> rename in Drive -> Sheets rows
 """
 
 from __future__ import annotations
@@ -39,16 +46,18 @@ log = logging.getLogger(__name__)
 _lock = threading.Lock()
 
 HELP_TEXT = (
-    "📸 Forward a receipt photo or PDF here and I'll archive it, read it and log it.\n\n"
+    "📸 Send a receipt photo or PDF here. I'll save it to Drive, then ask for the "
+    "supplier and the price.\n\n"
     "Commands:\n"
     "• daily – receipts logged today\n"
     "• summary – this month's spend by category\n"
-    "• /retry – re-run OCR on receipts that are pending\n"
     "• help – this message"
 )
 
 CATEGORY_CACHE_SECONDS = 300
-PRICE_WAIT_SECONDS = 600
+# How long the bot treats your next message as the answer it asked for.
+WAIT_SECONDS = 1800
+MAX_SUPPLIER_CHIPS = 12  # LINE allows 13 quick replies; the last is "Type name"
 DAILY_LIST_LIMIT = 30  # keeps the "daily" reply well under LINE's 5,000-character limit
 
 STATUS_OK = "ok"
@@ -56,6 +65,9 @@ STATUS_REVIEW = "needs_review"
 STATUS_PENDING = "pending_ocr"
 STATUS_FLAGGED = "flagged"
 STATUS_CONFIRMED = "confirmed"
+STATUS_INCOMPLETE = "incomplete"  # archived; supplier or price not given yet
+
+ASK_SUPPLIER, TYPE_SUPPLIER, ASK_PRICE = "supplier", "supplier_text", "price"
 
 
 def detect_type(content: bytes) -> tuple[str, str] | None:
@@ -131,17 +143,17 @@ class _Ocr:
 
 
 class Bot:
-    def __init__(self, settings: Settings, line, sheets, drive, ocr, now: Callable[[], datetime] | None = None):
+    def __init__(self, settings: Settings, line, sheets, drive, ocr=None, now: Callable[[], datetime] | None = None):
         self.settings = settings
         self.line = line
         self.sheets = sheets
         self.drive = drive
-        self.ocr = ocr
+        self.ocr = ocr  # only the backfill passes one; in LINE people type the details
         self._now = now or (lambda: datetime.now(settings.tz))
         self._cat_cache: tuple[float, list[Category]] | None = None
-        # (user, chat) -> (receipt_id, deadline) after "Change price". In memory: fine
-        # with one instance; a restart only means tapping the button again.
-        self._price_waits: dict[tuple[str, str], tuple[str, float]] = {}
+        # (user, chat) -> (receipt_id, step, deadline): what the bot asked that person.
+        # In memory: fine with one instance; after a restart the buttons still work.
+        self._waits: dict[tuple[str, str], tuple[str, str, float]] = {}
 
     # -- helpers ----------------------------------------------------------------
 
@@ -172,11 +184,12 @@ class Bot:
         )
 
     def _supplier_buttons(self, receipt_id: str) -> tuple[Button, ...]:
-        """The fixed list on the Suppliers tab, in sheet order."""
-        return tuple(
+        """The fixed list on the Suppliers tab, in sheet order, then "Type name"."""
+        chips = [
             Button(vendor_label(name), postback("ven", receipt_id, v=supplier_ref(name)))
-            for name in self.sheets.suppliers()[:13]
-        )
+            for name in self.sheets.suppliers()[:MAX_SUPPLIER_CHIPS]
+        ]
+        return (*chips, Button("✏️ Type name", postback("venin", receipt_id)))
 
     def _category_name(self, code: str) -> str:
         for c in self._categories():
@@ -221,7 +234,7 @@ class Bot:
 
     def handle_file_message(self, message, user_id: str, to: str) -> OutMessage:
         if isinstance(message, FileMessageContent):
-            if message.file_size and message.file_size > MAX_BYTES:
+            if self.ocr and message.file_size and message.file_size > MAX_BYTES:
                 return OutMessage(f"That file is {message.file_size / 1_048_576:.1f} MB; the limit is {MAX_BYTES // 1_048_576} MB.")
             filename = message.file_name or f"{message.id}.pdf"
         else:
@@ -229,53 +242,84 @@ class Bot:
         if user_id == to:
             self.line.show_loading(user_id)
         content = self.line.download(message.id)
-        return self.process_file(content, filename, submitted_by=user_id, source="line").message
+        outcome = self.process_file(content, filename, submitted_by=user_id, source="line")
+        if outcome.status == "waiting":
+            self._wait(user_id, to, outcome.receipt_id, ASK_SUPPLIER)
+        return outcome.message
 
     def handle_text(self, text: str, user_id: str = "", to: str = "") -> OutMessage | None:
-        """Only exact commands get an answer, plus the reply to "Change price";
-        any other chat is ignored."""
+        """Exact commands, and the answer to what the bot just asked (supplier name,
+        price); any other chat is ignored."""
         t = text.strip().lower()
         if t in {"daily", "/daily"}:
             return self.daily_list()
         if t in {"summary", "/summary"}:
             return self.month_summary()
-        if t in {"/retry", "retry"}:
+        if t in {"/retry", "retry"} and self.ocr:
             return self.retry_pending()
         if t in {"help", "/help"}:
             return OutMessage(HELP_TEXT)
-        rid = self._waiting_price(user_id, to)
-        if rid:
+        waiting = self._waiting(user_id, to)
+        if not waiting:
+            return None
+        rid, step = waiting
+        if t in {"cancel", "ยกเลิก"}:
+            self._waits.pop((user_id, to), None)
+            return OutMessage("OK, stopped. Tap a button on the receipt when you're ready.")
+        if step == ASK_PRICE:
             return self.handle_price_reply(rid, text, user_id, to)
+        # A typed supplier name counts after "Type name", or straight away in a 1:1
+        # chat; in a group, ordinary chat right after a photo mustn't become a name.
+        if step == TYPE_SUPPLIER or (step == ASK_SUPPLIER and to == user_id):
+            return self.handle_supplier_reply(rid, text, user_id, to)
         return None
 
-    # -- "Change price": the next message from the same person in the same chat
+    # -- what the bot asked: the next message from the same person in the same chat
 
-    def _waiting_price(self, user_id: str, to: str) -> str:
-        entry = self._price_waits.get((user_id, to))
-        if entry and entry[1] > time.monotonic():
-            return entry[0]
-        self._price_waits.pop((user_id, to), None)
-        return ""
+    def _wait(self, user_id: str, to: str, receipt_id: str, step: str) -> None:
+        self._waits[(user_id, to)] = (receipt_id, step, time.monotonic() + WAIT_SECONDS)
+
+    def _waiting(self, user_id: str, to: str) -> tuple[str, str] | None:
+        entry = self._waits.get((user_id, to))
+        if entry and entry[2] > time.monotonic():
+            return entry[0], entry[1]
+        self._waits.pop((user_id, to), None)
+        return None
+
+    def ask_supplier(self, receipt_id: str, intro: str) -> OutMessage:
+        if not self.sheets.suppliers():
+            return OutMessage(f"{intro}\nType the supplier name.",
+                              quick_replies=(Button("✏️ Type name", postback("venin", receipt_id)),))
+        return OutMessage(f"{intro}\nWhich supplier? Pick one, or tap ✏️ to type the name.",
+                          quick_replies=self._supplier_buttons(receipt_id))
 
     def ask_price(self, receipt: dict[str, str], user_id: str, to: str) -> OutMessage:
-        self._price_waits[(user_id, to)] = (receipt["receipt_id"], time.monotonic() + PRICE_WAIT_SECONDS)
+        self._wait(user_id, to, receipt["receipt_id"], ASK_PRICE)
         current = parse_amount(receipt.get("grand_total"))
         vendor = receipt.get("vendor_name") or receipt["receipt_id"]
-        now = f"now {fmt_baht(current)}" if current is not None else "no total yet"
-        return OutMessage(f'Type the correct total for {vendor} ({now}).\nSend "cancel" to stop.')
+        if current is None:
+            return OutMessage(f'Type the total price for {vendor}, e.g. 1250.\nSend "cancel" to stop.')
+        return OutMessage(f'Type the correct total for {vendor} (now {fmt_baht(current)}).\nSend "cancel" to stop.')
 
     def handle_price_reply(self, rid: str, text: str, user_id: str, to: str) -> OutMessage:
-        if text.strip().lower() in {"cancel", "ยกเลิก"}:
-            self._price_waits.pop((user_id, to), None)
-            return OutMessage("OK, the total wasn't changed.")
         amount = parse_typed_price(text)
         if amount is None:
             return OutMessage('That isn\'t a price. Type a number like 1250, or "cancel".')
-        self._price_waits.pop((user_id, to), None)
+        self._waits.pop((user_id, to), None)
         receipt = self.sheets.find_receipt(rid)
         if receipt is None:
             return OutMessage("I couldn't find that receipt any more.")
         return self.set_price(receipt, amount)
+
+    def handle_supplier_reply(self, rid: str, text: str, user_id: str, to: str) -> OutMessage:
+        name = re.sub(r"\s+", " ", text).strip()
+        if not 2 <= len(name) <= 80 or parse_typed_price(name) is not None:
+            return OutMessage('Type the supplier\'s name (e.g. "ร้านป้าแดง"), or "cancel".')
+        receipt = self.sheets.find_receipt(rid)
+        if receipt is None:
+            self._waits.pop((user_id, to), None)
+            return OutMessage("I couldn't find that receipt any more.")
+        return self.set_vendor_name(receipt, name, user_id, to)
 
     def set_price(self, receipt: dict[str, str], amount: Decimal) -> OutMessage:
         rid = receipt["receipt_id"]
@@ -284,19 +328,46 @@ class Bot:
         # Warnings about the total no longer apply once a person has typed it.
         problems = [
             p for p in receipt.get("review_note", "").split("; ")
-            if p and not p.startswith(("missing grand total", "VAT ", "total edited by hand"))
+            if p and not p.startswith(("missing grand total", "VAT ", "total edited by hand", "waiting for"))
         ]
+        if not receipt.get("vendor_name"):
+            problems.append("waiting for supplier")
         fields: dict[str, Any] = {
             "grand_total": amount,
             "net_before_vat": amount - vat,
-            "review_note": "; ".join(problems + [f"total edited by hand (was {fmt_baht(old)})"]),
+            # Keep a trail when a total that was already there is changed.
+            "review_note": "; ".join(problems + ([f"total edited by hand (was {fmt_baht(old)})"]
+                                                 if old is not None and old != amount else [])),
         }
-        if receipt.get("review_status") == STATUS_REVIEW and not problems:
+        if receipt.get("review_status") in (STATUS_REVIEW, STATUS_INCOMPLETE) and not problems:
             fields["review_status"] = STATUS_OK
         self.sheets.update_receipt(rid, fields)
-        self._rename_in_drive({**receipt, "grand_total": str(amount)}, receipt.get("vendor_name") or "unknown")
-        vendor = receipt.get("vendor_name") or rid
-        return OutMessage(f"✅ {vendor}: total changed from {fmt_baht(old)} to {fmt_baht(amount)}.")
+        receipt = {**receipt, **{k: str(v) for k, v in fields.items()}}
+        self._rename_in_drive(receipt, receipt.get("vendor_name") or "unknown")
+        return self.result_message(receipt)
+
+    def result_message(self, receipt: dict[str, str]) -> OutMessage:
+        """The saved receipt with buttons to revise it, plus category chips if it has none."""
+        rid = receipt["receipt_id"]
+        today = self.today()
+        d = parse_date(receipt.get("receipt_date"), today) or parse_date(receipt.get("received_at"), today)
+        category = receipt.get("category", "")
+        parts = [
+            fmt_baht(parse_amount(receipt.get("grand_total"))),
+            receipt.get("vendor_name") or "Unknown supplier",
+            self._category_name(category) if category else "❓ category",
+            f"{d:%d/%m}" if d else "no date",
+        ]
+        text = "Saved: " + " · ".join(parts) + (" ✅" if category else "")
+        buttons = (
+            Button("Change price", postback("price", rid)),
+            Button("Change category", postback("chcat", rid)),
+            Button("Change supplier", postback("chven", rid)),
+        )
+        if not category:
+            return OutMessage(text + "\nNew supplier: pick a category below.", buttons=buttons,
+                              quick_replies=self._category_buttons(rid))
+        return OutMessage(text, buttons=buttons)
 
     def handle_postback(self, data: str, user_id: str = "", to: str = "") -> OutMessage:
         q = {k: v[0] for k, v in parse_qs(data).items()}
@@ -322,34 +393,40 @@ class Bot:
             if code not in {c.code for c in self._categories()}:
                 return OutMessage("Unknown category.")
             self.set_category(receipt, code)
-            vendor = receipt.get("vendor_name") or "this vendor"
-            return OutMessage(f"✅ {vendor} → {self._category_name(code)}. I'll remember this vendor.")
+            return self.result_message({**receipt, "category": code})
         if action == "chven":
-            chips = self._supplier_buttons(rid)
-            if not chips:
-                return OutMessage("The Suppliers tab in the Sheet is empty. Add supplier names there first.")
-            return OutMessage(f"Pick the supplier for {receipt.get('vendor_name') or rid}:", quick_replies=chips)
+            self._wait(user_id, to, rid, ASK_SUPPLIER)
+            return self.ask_supplier(rid, f"Change the supplier for {receipt.get('vendor_name') or rid}.")
+        if action == "venin":
+            self._wait(user_id, to, rid, TYPE_SUPPLIER)
+            return OutMessage('Type the supplier name.\nSend "cancel" to stop.')
         if action == "ven":
-            return self.set_vendor(receipt, q.get("v", ""))
+            return self.set_vendor(receipt, q.get("v", ""), user_id, to)
         if action == "price":
             return self.ask_price(receipt, user_id, to)
         return OutMessage(HELP_TEXT)
 
-    def set_vendor(self, receipt: dict[str, str], ref: str) -> OutMessage:
-        """The user picked a supplier from the Suppliers tab: the OCR found none or got it wrong."""
-        rid = receipt["receipt_id"]
+    def set_vendor(self, receipt: dict[str, str], ref: str, user_id: str = "", to: str = "") -> OutMessage:
+        """The user picked a supplier chip from the Suppliers tab."""
         name = next((n for n in self.sheets.suppliers() if supplier_ref(n) == ref), None)
         if name is None:
             return OutMessage("That supplier isn't on the Suppliers tab any more.")
+        return self.set_vendor_name(receipt, name, user_id, to)
+
+    def set_vendor_name(self, receipt: dict[str, str], name: str, user_id: str = "", to: str = "") -> OutMessage:
+        """Save the supplier (picked or typed), then ask for the price if there is none yet."""
+        rid = receipt["receipt_id"]
         vendors = self.sheets.vendors()
-        vendor = find_vendor(vendors, "", name) or Vendor(
-            vendor_key("", name), "", name, first_seen=self.today().isoformat()
-        )
+        known = find_vendor(vendors, "", name)
+        if known:
+            name = known.name  # a typed "makro" is saved as the vendor's usual name
+        vendor = known or Vendor(vendor_key("", name), "", name, first_seen=self.today().isoformat())
         old_name = receipt.get("vendor_name", "")
         if old_name and normalize_vendor_name(old_name) != normalize_vendor_name(name):
             wrong = find_vendor(vendors, "", old_name)
-            # Remember the misreading so the next receipt like this matches by itself.
-            if old_name not in vendor.aliases:
+            # An OCR misreading is remembered so the next receipt like it matches by
+            # itself; a supplier a person picked by mistake is just a different shop.
+            if receipt.get("source") != "line" and old_name not in vendor.aliases:
                 vendor.aliases.append(old_name)
             if wrong and wrong.vendor_key != vendor.vendor_key:
                 if not wrong.category and wrong.receipt_count <= 1:
@@ -358,9 +435,13 @@ class Bot:
                     wrong.receipt_count = max(0, wrong.receipt_count - 1)
                     self.sheets.save_vendor(wrong)
 
-        problems = [p for p in receipt.get("review_note", "").split("; ") if p and p != "missing vendor"]
+        has_price = parse_amount(receipt.get("grand_total")) is not None
+        problems = [p for p in receipt.get("review_note", "").split("; ")
+                    if p and p != "missing vendor" and not p.startswith("waiting for")]
+        if not has_price:
+            problems.append("waiting for price")
         fields: dict[str, Any] = {"vendor_name": name, "review_note": "; ".join(problems)}
-        if receipt.get("review_status") == STATUS_REVIEW and not problems:
+        if receipt.get("review_status") in (STATUS_REVIEW, STATUS_INCOMPLETE) and not problems:
             fields["review_status"] = STATUS_OK
         if vendor.category:
             fields["category"] = vendor.category
@@ -368,11 +449,13 @@ class Bot:
         self.sheets.update_receipt(rid, fields)
         vendor.receipt_count += 1
         self.sheets.save_vendor(vendor)
+        receipt = {**receipt, **fields}
         self._rename_in_drive(receipt, name)
 
-        if vendor.category:
-            return OutMessage(f"✅ {name} · {self._category_name(vendor.category)}. Saved.")
-        return OutMessage(f"✅ {name}. Now pick a category:", quick_replies=self._category_buttons(rid))
+        if not has_price:
+            return OutMessage(f"Supplier: {name}\n" + self.ask_price(receipt, user_id, to).text)
+        self._waits.pop((user_id, to), None)
+        return self.result_message(receipt)
 
     def _rename_in_drive(self, receipt: dict[str, str], vendor_name: str) -> None:
         """Same name pattern as _finish, now that the vendor is known."""
@@ -450,6 +533,21 @@ class Bot:
             "file_hash": file_hash,
             "source": source,
         }
+
+        if self.ocr is None:
+            # 2. No OCR: log the row now; the supplier and price come from the person.
+            record.update(receipt_date=received_at.date(), review_status=STATUS_INCOMPLETE,
+                          review_note="waiting for supplier and price")
+            try:
+                self.sheets.add_receipt(record, [])
+            except Exception as exc:
+                log.exception("Sheets write failed")
+                self.sheets.log("ERROR", f"Sheets write failed: {exc}", receipt_id, self.now())
+                self.notify_owner(f"Couldn't write {receipt_id} to the Sheet; the file is safe in Drive.")
+                return Outcome(
+                    "error", OutMessage(f"📁 Saved to Drive as {receipt_id}, but I couldn't update the Sheet. The owner has been told."), receipt_id
+                )
+            return Outcome("waiting", self.ask_supplier(receipt_id, f"📁 Saved to Drive ({receipt_id})."), receipt_id)
 
         # 2. Check the OCR limits, then OCR.
         limit_problem = ""
@@ -624,12 +722,15 @@ class Bot:
         if not rows:
             return OutMessage(f"No receipts logged today ({today:%d/%m}) yet.")
         icons = {STATUS_OK: "✅", STATUS_CONFIRMED: "✅", STATUS_REVIEW: "⚠️",
-                 STATUS_FLAGGED: "🚩", STATUS_PENDING: "⏳"}
+                 STATUS_FLAGGED: "🚩", STATUS_PENDING: "⏳", STATUS_INCOMPLETE: "⏳"}
         entries = []
         for r in rows:
             status = r.get("review_status", "")
             if status == STATUS_PENDING:
                 entries.append(f"⏳ {r.get('receipt_id', '')} · waiting for OCR")
+                continue
+            if status == STATUS_INCOMPLETE and not r.get("vendor_name"):
+                entries.append(f"⏳ {r.get('receipt_id', '')} · waiting for supplier and price")
                 continue
             category = self._category_name(r["category"]) if r.get("category") else "❓ category"
             parts = [fmt_baht(parse_amount(r.get("grand_total"))), r.get("vendor_name") or "Unknown vendor", category]

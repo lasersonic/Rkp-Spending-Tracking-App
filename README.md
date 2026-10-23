@@ -1,37 +1,53 @@
 # Restaurant Expense Tracker (LINE bot)
 
-Forward a supplier receipt (photo or PDF) to the restaurant's LINE Official
-Account. The bot archives the original in Google Drive, reads it with Google
-Cloud Vision OCR, checks the numbers, categorizes the spend, logs it to
+Send a supplier receipt (photo or PDF) to the restaurant's LINE Official
+Account. The bot saves the original in Google Drive, asks which supplier it
+is and how much it was, categorizes the spend from the supplier, logs it to
 Google Sheets and replies in LINE:
 
 ```
-฿1,240 · Makro · Food cost · 17/10 ✅      [OK] [Change category] [Flag]
+📁 Saved to Drive (R261023-a1b2c3).
+Which supplier? Pick one, or tap ✏️ to type the name.
+   [ร้านผักสมบัติโน๊ต] [หมูอนามัย BETAGRO] … [✏️ Type name]
+→ tap a supplier
+Supplier: ร้านหมูอนามัย BETAGRO
+Type the total price for ร้านหมูอนามัย BETAGRO, e.g. 1250.
+→ type 1250
+Saved: ฿1,250 · ร้านหมูอนามัย BETAGRO · Food cost · 23/10 ✅
+   [Change price] [Change category] [Change supplier]
 ```
 
-Spec: v1.0, 17 Oct 2026. Cost: free at 60–80 receipts a month (Vision reads
-1,000 pages a month free; Cloud Run stays in its free tier).
+There is no OCR in this flow: people type the supplier and price, so nothing
+is misread and nothing costs money. Only the one-time Telegram backfill reads
+receipts with Google Cloud Vision (free for 1,000 pages a month), because no
+one is there to answer questions for hundreds of old photos.
+
+Spec: v1.0, 17 Oct 2026. Cost: free (Cloud Run stays in its free tier).
 
 ## How it works
 
 ```
-LINE ──forward──▶ LINE OA ──webhook──▶ Cloud Run (FastAPI)
-                                         │
-       download ─▶ dedupe (SHA-256) ─▶ Drive /Receipts/YYYY/MM/ ─▶ Vision OCR
-       ─▶ normalize (BE→CE dates, amounts) ─▶ validate ─▶ dedupe (vendor + invoice no.)
-       ─▶ categorize (vendor memory) ─▶ rename in Drive ─▶ Sheets rows ─▶ LINE reply
+LINE ──send──▶ LINE OA ──webhook──▶ Cloud Run (FastAPI)
+                                      │
+   download ─▶ dedupe (SHA-256) ─▶ Drive /Receipts/YYYY/MM/ ─▶ Sheets row (incomplete)
+   ─▶ ask supplier (Suppliers tab chips or typed) ─▶ category from vendor memory
+   ─▶ ask price ─▶ Sheets row (ok) ─▶ rename in Drive ─▶ result + buttons
 ```
+
+The backfill (`scripts/backfill.py`) instead runs:
+download ─▶ dedupe ─▶ Drive ─▶ Vision OCR ─▶ validate ─▶ dedupe (vendor + invoice no.)
+─▶ categorize ─▶ rename in Drive ─▶ Sheets rows.
 
 | File | What it does |
 |---|---|
 | `app/main.py` | `POST /callback`: checks the LINE signature, returns 200, processes in the background |
-| `app/pipeline.py` | The pipeline above, buttons, `summary`, `/retry`, `help` |
-| `app/vision.py` | Vision OCR call with retries; the rule-based parser that turns its text into receipt fields |
+| `app/pipeline.py` | The flow above, the questions and buttons, `daily`, `summary`, `help`; the OCR flow for the backfill |
+| `app/vision.py` | Vision OCR call with retries and the rule-based receipt parser (backfill only) |
 | `app/normalize.py` | Thai dates/amounts, the validation rules |
 | `app/categorize.py` | Categories and vendor matching (tax ID, then name/aliases) |
 | `app/storage.py` | Sheets tabs and Drive archive |
 | `app/dashboard.py` | Dashboard tab formulas |
-| `scripts/try_ocr.py` | M0: run your own receipts through Vision |
+| `scripts/try_ocr.py` | Run receipts through Vision (to check the backfill's OCR) |
 | `scripts/setup.py` | M1: Drive token, Drive folder, Sheet tabs |
 | `scripts/check_setup.py` | Pre-flight check of every integration |
 | `scripts/backfill.py` | M4: import the Telegram archive |
@@ -40,34 +56,44 @@ LINE ──forward──▶ LINE OA ──webhook──▶ Cloud Run (FastAPI)
 
 | You do | Bot does |
 |---|---|
-| Send/forward a photo or PDF | Archives, reads, logs and replies with a summary and buttons |
-| **Change category** | Shows category chips; your choice updates the row and the vendor's memory |
-| **Change supplier** | Shows the **Suppliers** tab as chips; your choice replaces the vendor, applies its category and remembers the misread name |
-| **Change price** | Asks for the correct total; your next message (e.g. `1250`, `฿1,250.50`) sets `grand_total`. `cancel` stops; it gives up after 10 minutes |
-| `daily` | Receipts logged today (by arrival time): amount, vendor, category, status, and the day's total |
+| Send/forward a photo or PDF | Saves it to Drive, logs a row and asks **which supplier** |
+| Tap a supplier, or **✏️ Type name** and type it | Saves the supplier (and its remembered category), then asks **the price** |
+| Type the price (e.g. `1250`, `฿1,250.50`, `๑๒๕๐ บาท`) | Saves it and shows the result with **Change price**, **Change category**, **Change supplier** |
+| **Change price** | Asks for the correct total; your next message replaces it |
+| **Change category** | Shows category chips; your choice updates the row and the supplier's memory |
+| **Change supplier** | Shows the supplier chips again; the price is kept |
+| `cancel` | Stops the current question; the buttons on the message still work later |
+| `daily` | Receipts logged today (by arrival time): amount, supplier, category, status, and the day's total |
 | `summary` | Month-to-date spend by category |
-| `/retry` | Re-runs OCR on `pending_ocr` receipts (e.g. after fixing Vision API access) |
 | `help` | Usage |
+
+The bot takes your next message as the answer for 30 minutes after it asks;
+after that, tap the button on the message again. Answers only count from the
+person who sent the photo, in the same chat. In a 1:1 chat you can type the
+supplier name straight away; in a group chat tap **✏️ Type name** first, so
+ordinary chat isn't taken as a name.
 
 Any other message (chat, stickers) gets no reply, so the bot can sit in a
 group chat. In a group only allowlisted people are processed; turn on
 "Allow bot to join group chats" in the LINE console to invite it.
 
-The first receipt from a new vendor asks for a category. Every later receipt
-from that vendor is categorized automatically. When the OCR finds no vendor,
-the reply asks "Which shop is this?" with the same Suppliers chips.
+The first receipt from a new supplier asks for a category. Every later receipt
+from that supplier is categorized automatically. A typed name matches a known
+supplier regardless of spacing and case.
 
 The **Suppliers** tab is a fixed list you maintain: one name per row in the
-`name` column, up to 13 shown. The **Vendors** tab is the bot's own memory of
-categories, tax IDs and alternative spellings.
+`name` column, up to 12 shown (plus "Type name"). Typed names that aren't on
+it are remembered on the **Vendors** tab, the bot's own memory of categories,
+tax IDs and alternative spellings; add them to Suppliers to get a chip.
 
-`review_status` values: `ok`, `needs_review` (a check failed; see `review_note`),
-`pending_ocr`; `flagged` and `confirmed` can be typed in by hand.
+`review_status` values: `ok`, `incomplete` (supplier or price not given yet),
+`needs_review` (backfill: a check failed; see `review_note`), `pending_ocr`
+(backfill: OCR failed); `flagged` and `confirmed` can be typed in by hand.
 
 ## Setup
 
-### M0: accuracy test (optional)
-Vision only returns text and word positions; `app/vision.py` finds the fields
+### M0: backfill OCR test (optional)
+Only needed before the Telegram backfill. Vision only returns text and word positions; `app/vision.py` finds the fields
 itself (labels such as "Grand Total"/"รวมทั้งหมด", tax IDs with a valid checksum,
 dates, table rows). To see what it makes of your receipts:
 ```bash
@@ -87,10 +113,11 @@ Change price / Change supplier buttons. HEIC files are archived but not read
 1. **LINE**: create a LINE Official Account and enable the Messaging API
    (LINE Developers console). Note the *Channel secret* and issue a
    *Channel access token*.
-2. **Google Cloud**: create a project with billing on (Vision needs it even
-   when it stays free; add a budget alert to be safe); enable Cloud Run,
-   Sheets, Drive, Secret Manager and **Cloud Vision** APIs; create a service
-   account and download its JSON key. The same key is used for Vision.
+2. **Google Cloud**: create a project; enable Cloud Run, Sheets, Drive and
+   Secret Manager APIs; create a service account and download its JSON key.
+   For the Telegram backfill only, also enable the **Cloud Vision** API (it
+   needs billing on even while it stays free; add a budget alert to be safe).
+   The same key is used for Vision.
 3. **Sheet**: create an empty Google Sheet and share it (Editor) with the
    service account's email. `SHEET_ID` is the long ID in its URL. Then:
    ```bash
