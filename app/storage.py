@@ -13,7 +13,7 @@ import logging
 import re
 import time
 from collections.abc import Callable
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Any, TypeVar
 
@@ -101,6 +101,23 @@ def to_cell(column: str, value: Any) -> Any:
     return "'" + text
 
 
+_SHEETS_EPOCH = datetime(1899, 12, 30)  # day 0 of a Sheets date serial number
+
+
+def from_cell(column: str, value: Any) -> str:
+    """A raw (unformatted) cell value as text: date serials -> ISO, numbers -> plain digits."""
+    if isinstance(value, bool):
+        return "TRUE" if value else "FALSE"
+    if isinstance(value, (int, float)):
+        if column in _DATE_COLUMNS:
+            moment = _SHEETS_EPOCH + timedelta(seconds=round(value * 86400))
+            return moment.date().isoformat() if column in {"receipt_date", "first_seen"} else f"{moment:%Y-%m-%d %H:%M:%S}"
+        if isinstance(value, float) and value.is_integer():
+            return str(int(value))
+        return str(value)
+    return "" if value is None else str(value)
+
+
 def col_letter(index: int) -> str:
     """0 -> A, 25 -> Z, 26 -> AA."""
     letters = ""
@@ -170,11 +187,22 @@ class SheetStore:
     # -- generic helpers ------------------------------------------------------
 
     def _records(self, tab: str) -> list[dict[str, str]]:
-        rows = with_retry(lambda: self.ws(tab).get_all_values(), f"read {tab}")
+        # Raw values, not what the cells display: displayed dates follow the Sheet's
+        # locale (10/23/2026 in en_US) and its number formats, so they can't be parsed
+        # reliably. Raw dates are serial numbers, turned back into ISO text here.
+        rows = with_retry(
+            lambda: self.ws(tab).get_all_values(
+                value_render_option="UNFORMATTED_VALUE", date_time_render_option="SERIAL_NUMBER"
+            ),
+            f"read {tab}",
+        )
         if not rows:
             return []
-        header = rows[0]
-        return [dict(zip(header, r + [""] * (len(header) - len(r)))) for r in rows[1:]]
+        header = [str(h) for h in rows[0]]
+        return [
+            {h: from_cell(h, v) for h, v in zip(header, list(r) + [""] * (len(header) - len(r)))}
+            for r in rows[1:]
+        ]
 
     def _append(self, tab: str, columns: list[str], records: list[dict[str, Any]]) -> None:
         if not records:

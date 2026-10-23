@@ -36,7 +36,7 @@ class FakeWorksheet:
             r.append("")
         r[col - 1] = value
 
-    def get_all_values(self):
+    def get_all_values(self, **render_options):
         width = max((len(r) for r in self.grid), default=0)
         return [r + [""] * (width - len(r)) for r in self.grid]
 
@@ -138,3 +138,26 @@ def test_log_never_raises():
     del ss.tabs["Log"]
     store._ws.pop("Log")
     store.log("ERROR", "still fine")
+
+
+def test_reads_raw_dates_whatever_the_sheet_locale():
+    """A Sheet in en_US shows 10/23/2026; the store asks for raw serial numbers instead."""
+    from app.storage import from_cell
+
+    class RawWorksheet:
+        def get_all_values(self, **render_options):
+            assert render_options == {"value_render_option": "UNFORMATTED_VALUE",
+                                      "date_time_render_option": "SERIAL_NUMBER"}
+            return [["receipt_id", "received_at", "receipt_date", "grand_total", "pages", "invoice_no"],
+                    ["R1", 46318.4266435185, 46318, 1250.5, 1, "0012345"],
+                    ["R2", "typed by hand", "", 180, 2.0]]
+
+    store = SheetStore(None)
+    store._ws["Receipts"] = RawWorksheet()
+    assert store.receipts() == [
+        {"receipt_id": "R1", "received_at": "2026-10-23 10:14:22", "receipt_date": "2026-10-23",
+         "grand_total": "1250.5", "pages": "1", "invoice_no": "0012345"},
+        {"receipt_id": "R2", "received_at": "typed by hand", "receipt_date": "", "grand_total": "180",
+         "pages": "2", "invoice_no": ""},
+    ]
+    assert from_cell("first_seen", 46312) == "2026-10-17" and from_cell("x", True) == "TRUE"
