@@ -1,13 +1,16 @@
 """The receipt pipeline and the bot's conversation logic.
 
-In LINE (no OCR):
-download -> dedupe (hash) -> archive in Drive -> Sheets row (incomplete)
--> ask the supplier (Suppliers tab chips, or typed) -> ask the price
+In LINE:
+download -> dedupe (hash) -> archive in Drive -> Vision OCR -> Sheets row (unconfirmed)
+-> "I read: ฿1,250 · Makro · 22/10" [Confirm] [Enter manually]
+   Confirm: keep it, ask only for what OCR missed
+   Enter manually (or nothing read): ask the supplier (Suppliers tab chips or typed),
+   then the price
 -> save, rename in Drive -> reply with the result and Change price /
-Change category / Change supplier buttons
+   Change category / Change supplier buttons
 
-The one-time Telegram backfill has no one to ask, so a Bot built with an
-`ocr` client reads each file instead:
+The one-time Telegram backfill has no one to ask, so there the OCR reading is
+logged as it is:
 download -> dedupe -> archive -> OCR -> validate -> dedupe (invoice no.)
 -> categorize -> rename in Drive -> Sheets rows
 """
@@ -46,8 +49,8 @@ log = logging.getLogger(__name__)
 _lock = threading.Lock()
 
 HELP_TEXT = (
-    "📸 Send a receipt photo or PDF here. I'll save it to Drive, then ask for the "
-    "supplier and the price.\n\n"
+    "📸 Send a receipt photo or PDF here. I'll save it to Drive and read the supplier "
+    "and price for you to confirm, or you can enter them yourself.\n\n"
     "Commands:\n"
     "• daily – receipts logged today\n"
     "• summary – this month's spend by category\n"
@@ -66,6 +69,7 @@ STATUS_PENDING = "pending_ocr"
 STATUS_FLAGGED = "flagged"
 STATUS_CONFIRMED = "confirmed"
 STATUS_INCOMPLETE = "incomplete"  # archived; supplier or price not given yet
+STATUS_UNCONFIRMED = "unconfirmed"  # read by OCR; the sender hasn't confirmed it yet
 
 ASK_SUPPLIER, TYPE_SUPPLIER, ASK_PRICE = "supplier", "supplier_text", "price"
 
@@ -120,6 +124,15 @@ def parse_typed_price(text: str) -> Decimal | None:
     return amount if amount is not None and amount > 0 else None
 
 
+def _status_for(problems: list[str]) -> str:
+    """Status once a person has answered: still waiting for something, a warning left, or done."""
+    if any(p.startswith("waiting for") for p in problems):
+        return STATUS_INCOMPLETE
+    if any(not p.startswith("total edited by hand") for p in problems):
+        return STATUS_REVIEW
+    return STATUS_OK
+
+
 def vendor_label(name: str) -> str:
     """LINE chip labels max 20 chars: drop the "ร้าน" (shop) prefix before cutting."""
     if len(name) > 20 and name.startswith("ร้าน"):
@@ -148,7 +161,7 @@ class Bot:
         self.line = line
         self.sheets = sheets
         self.drive = drive
-        self.ocr = ocr  # only the backfill passes one; in LINE people type the details
+        self.ocr = ocr  # Vision; without it every receipt is entered by hand
         self._now = now or (lambda: datetime.now(settings.tz))
         self._cat_cache: tuple[float, list[Category]] | None = None
         # (user, chat) -> (receipt_id, step, deadline): what the bot asked that person.
@@ -234,15 +247,13 @@ class Bot:
 
     def handle_file_message(self, message, user_id: str, to: str) -> OutMessage:
         if isinstance(message, FileMessageContent):
-            if self.ocr and message.file_size and message.file_size > MAX_BYTES:
-                return OutMessage(f"That file is {message.file_size / 1_048_576:.1f} MB; the limit is {MAX_BYTES // 1_048_576} MB.")
             filename = message.file_name or f"{message.id}.pdf"
         else:
             filename = f"{message.id}.jpg"
         if user_id == to:
             self.line.show_loading(user_id)
         content = self.line.download(message.id)
-        outcome = self.process_file(content, filename, submitted_by=user_id, source="line")
+        outcome = self.process_file(content, filename, submitted_by=user_id, source="line", interactive=True)
         if outcome.status == "waiting":
             self._wait(user_id, to, outcome.receipt_id, ASK_SUPPLIER)
         return outcome.message
@@ -328,7 +339,7 @@ class Bot:
         # Warnings about the total no longer apply once a person has typed it.
         problems = [
             p for p in receipt.get("review_note", "").split("; ")
-            if p and not p.startswith(("missing grand total", "VAT ", "total edited by hand", "waiting for"))
+            if p and not p.startswith(("missing grand total", "VAT ", "total edited by hand", "waiting for", "read by OCR"))
         ]
         if not receipt.get("vendor_name"):
             problems.append("waiting for supplier")
@@ -339,8 +350,8 @@ class Bot:
             "review_note": "; ".join(problems + ([f"total edited by hand (was {fmt_baht(old)})"]
                                                  if old is not None and old != amount else [])),
         }
-        if receipt.get("review_status") in (STATUS_REVIEW, STATUS_INCOMPLETE) and not problems:
-            fields["review_status"] = STATUS_OK
+        if receipt.get("review_status") in (STATUS_REVIEW, STATUS_INCOMPLETE, STATUS_UNCONFIRMED):
+            fields["review_status"] = _status_for(problems)
         self.sheets.update_receipt(rid, fields)
         receipt = {**receipt, **{k: str(v) for k, v in fields.items()}}
         self._rename_in_drive(receipt, receipt.get("vendor_name") or "unknown")
@@ -402,6 +413,10 @@ class Bot:
             return OutMessage('Type the supplier name.\nSend "cancel" to stop.')
         if action == "ven":
             return self.set_vendor(receipt, q.get("v", ""), user_id, to)
+        if action == "conf":
+            return self.confirm_reading(receipt, user_id, to)
+        if action == "manual":
+            return self.enter_manually(receipt, user_id, to)
         if action == "price":
             return self.ask_price(receipt, user_id, to)
         return OutMessage(HELP_TEXT)
@@ -437,12 +452,12 @@ class Bot:
 
         has_price = parse_amount(receipt.get("grand_total")) is not None
         problems = [p for p in receipt.get("review_note", "").split("; ")
-                    if p and p != "missing vendor" and not p.startswith("waiting for")]
+                    if p and p != "missing vendor" and not p.startswith(("waiting for", "read by OCR"))]
         if not has_price:
             problems.append("waiting for price")
         fields: dict[str, Any] = {"vendor_name": name, "review_note": "; ".join(problems)}
-        if receipt.get("review_status") in (STATUS_REVIEW, STATUS_INCOMPLETE) and not problems:
-            fields["review_status"] = STATUS_OK
+        if receipt.get("review_status") in (STATUS_REVIEW, STATUS_INCOMPLETE, STATUS_UNCONFIRMED):
+            fields["review_status"] = _status_for(problems)
         if vendor.category:
             fields["category"] = vendor.category
             self.sheets.set_items_category(rid, vendor.category)
@@ -495,11 +510,14 @@ class Bot:
         submitted_by: str,
         source: str,
         received_at: datetime | None = None,
+        interactive: bool = False,
     ) -> Outcome:
+        """`interactive`: someone in LINE will confirm or type the details. Otherwise
+        (the backfill) the OCR reading is logged as it is."""
         with _lock:
-            return self._process_file(content, filename, submitted_by, source, received_at)
+            return self._process_file(content, filename, submitted_by, source, received_at, interactive)
 
-    def _process_file(self, content, filename, submitted_by, source, received_at) -> Outcome:
+    def _process_file(self, content, filename, submitted_by, source, received_at, interactive=False) -> Outcome:
         received_at = received_at or self.now()
         kind = detect_type(content)
         if kind is None:
@@ -534,20 +552,8 @@ class Bot:
             "source": source,
         }
 
-        if self.ocr is None:
-            # 2. No OCR: log the row now; the supplier and price come from the person.
-            record.update(receipt_date=received_at.date(), review_status=STATUS_INCOMPLETE,
-                          review_note="waiting for supplier and price")
-            try:
-                self.sheets.add_receipt(record, [])
-            except Exception as exc:
-                log.exception("Sheets write failed")
-                self.sheets.log("ERROR", f"Sheets write failed: {exc}", receipt_id, self.now())
-                self.notify_owner(f"Couldn't write {receipt_id} to the Sheet; the file is safe in Drive.")
-                return Outcome(
-                    "error", OutMessage(f"📁 Saved to Drive as {receipt_id}, but I couldn't update the Sheet. The owner has been told."), receipt_id
-                )
-            return Outcome("waiting", self.ask_supplier(receipt_id, f"📁 Saved to Drive ({receipt_id})."), receipt_id)
+        if interactive or self.ocr is None:
+            return self._start_in_chat(record, content, filename, mime, pages, received_at)
 
         # 2. Check the OCR limits, then OCR.
         limit_problem = ""
@@ -585,14 +591,119 @@ class Bot:
 
         return self._finish(record, r, result.problems, file_id, ext, self.sheets.add_receipt)
 
+    def _start_in_chat(self, record: dict[str, Any], content: bytes, filename: str, mime: str,
+                       pages: int, received_at: datetime) -> Outcome:
+        """LINE: read the receipt with OCR and ask the sender to confirm what was read.
+        Without OCR, or when it reads neither supplier nor price, ask them to type it."""
+        receipt_id = record["receipt_id"]
+        r = None
+        ocr_fits = len(content) <= MAX_BYTES and pages <= MAX_PDF_PAGES and mime != "image/heic"
+        if self.ocr and ocr_fits:
+            r = self._run_ocr(content, filename, mime, receipt_id, received_at.date()).data
+
+        name, category = self._match_supplier(r) if r else ("", "")
+        total = r.grand_total if r else None
+        if not name and total is None:
+            record.update(receipt_date=received_at.date(), review_status=STATUS_INCOMPLETE,
+                          review_note="waiting for supplier and price")
+            intro = f"📁 Saved to Drive ({receipt_id})." + ("\nI couldn't read the supplier or the price." if self.ocr else "")
+            outcome = Outcome("waiting", self.ask_supplier(receipt_id, intro), receipt_id)
+        else:
+            received = received_at.date()
+            plausible = r.receipt_date and timedelta(0) <= received - r.receipt_date <= timedelta(days=366)
+            note = ["read by OCR, not confirmed yet"]
+            dup = self.sheets.invoice_exists(name, r.invoice_no) if name and r.invoice_no else None
+            if dup:
+                note.append(f"possible duplicate of {dup}")
+            record.update(
+                receipt_date=r.receipt_date if plausible else received,
+                invoice_no=r.invoice_no,
+                vendor_name=name,
+                category=category,
+                subtotal=r.subtotal,
+                vat=r.vat,
+                grand_total=total,
+                net_before_vat=r.net_before_vat,
+                min_confidence=r.min_confidence,
+                review_status=STATUS_UNCONFIRMED,
+                review_note="; ".join(note),
+            )
+            outcome = Outcome("confirm", self.confirm_message(record, dup), receipt_id)
+        try:
+            self.sheets.add_receipt(record, [])
+        except Exception as exc:
+            log.exception("Sheets write failed")
+            self.sheets.log("ERROR", f"Sheets write failed: {exc}", receipt_id, self.now())
+            self.notify_owner(f"Couldn't write {receipt_id} to the Sheet; the file is safe in Drive.")
+            return Outcome(
+                "error", OutMessage(f"📁 Saved to Drive as {receipt_id}, but I couldn't update the Sheet. The owner has been told."), receipt_id
+            )
+        return outcome
+
+    def _match_supplier(self, r: ReceiptData) -> tuple[str, str]:
+        """(name, category) for what the OCR read: a known vendor (by tax ID, name or a
+        remembered misreading), else a Suppliers tab entry, else the name as read."""
+        vendor = find_vendor(self.sheets.vendors(), r.vendor_tax_id, r.vendor_name)
+        if vendor:
+            return vendor.name, vendor.category
+        read = normalize_vendor_name(r.vendor_name)
+        if read:
+            for name in self.sheets.suppliers():
+                listed = normalize_vendor_name(name)
+                if listed and (listed == read or (min(len(listed), len(read)) >= 4 and (listed in read or read in listed))):
+                    return name, ""
+        return r.vendor_name, ""
+
+    def confirm_message(self, record: dict[str, Any], duplicate_of: str | None = None) -> OutMessage:
+        rid = record["receipt_id"]
+        d = record.get("receipt_date")
+        parts = [
+            fmt_baht(record.get("grand_total")) if record.get("grand_total") is not None else "price ?",
+            record.get("vendor_name") or "supplier ?",
+            f"{d:%d/%m}" if d else "no date",
+        ]
+        text = f"📁 Saved ({rid}).\nI read: " + " · ".join(parts)
+        if duplicate_of:
+            text += f"\n⚠️ Same invoice as {duplicate_of}?"
+        text += "\nIs this right?"
+        return OutMessage(text, buttons=(
+            Button("✅ Confirm", postback("conf", rid)),
+            Button("✏️ Enter manually", postback("manual", rid)),
+        ))
+
+    def confirm_reading(self, receipt: dict[str, str], user_id: str, to: str) -> OutMessage:
+        """"Confirm": keep what the OCR read, then ask only for what it missed."""
+        rid = receipt["receipt_id"]
+        if receipt.get("review_status") != STATUS_UNCONFIRMED:
+            return self.result_message(receipt)  # tapped twice
+        if receipt.get("vendor_name"):
+            return self.set_vendor_name(receipt, receipt["vendor_name"], user_id, to)
+        fields = {"review_status": STATUS_INCOMPLETE, "review_note": "waiting for supplier"}
+        self.sheets.update_receipt(rid, fields)
+        self._wait(user_id, to, rid, ASK_SUPPLIER)
+        return self.ask_supplier(rid, f"Price {fmt_baht(parse_amount(receipt.get('grand_total')))} saved.")
+
+    def enter_manually(self, receipt: dict[str, str], user_id: str, to: str) -> OutMessage:
+        """"Enter manually": drop what the OCR read and ask for supplier, then price."""
+        rid = receipt["receipt_id"]
+        received = parse_date(receipt.get("received_at"), self.today()) or self.today()
+        cleared: dict[str, Any] = {c: None for c in (
+            "invoice_no", "vendor_name", "category", "subtotal", "vat", "grand_total",
+            "net_before_vat", "min_confidence")}
+        cleared.update(receipt_date=received, review_status=STATUS_INCOMPLETE,
+                       review_note="waiting for supplier and price")
+        self.sheets.update_receipt(rid, cleared)
+        self._wait(user_id, to, rid, ASK_SUPPLIER)
+        return self.ask_supplier(rid, "OK, enter it yourself.")
+
     def _run_ocr(self, content: bytes, filename: str, mime: str, receipt_id: str, as_of: date) -> _Ocr:
         try:
             data = self.ocr.read(content, filename, mime, as_of)
         except OcrAuthError as exc:
             self.sheets.log("ERROR", str(exc), receipt_id, self.now())
             self.notify_owner(
-                f"Google Vision OCR: {exc}. Receipts are being saved as pending_ocr; "
-                "check the Vision API and billing in Google Cloud, then send /retry."
+                f"Google Vision OCR: {exc}. Receipts are still saved, but can't be read; "
+                "check the Vision API and billing in Google Cloud."
             )
             return _Ocr(error=str(exc))
         except OcrError as exc:
@@ -722,7 +833,7 @@ class Bot:
         if not rows:
             return OutMessage(f"No receipts logged today ({today:%d/%m}) yet.")
         icons = {STATUS_OK: "✅", STATUS_CONFIRMED: "✅", STATUS_REVIEW: "⚠️",
-                 STATUS_FLAGGED: "🚩", STATUS_PENDING: "⏳", STATUS_INCOMPLETE: "⏳"}
+                 STATUS_FLAGGED: "🚩", STATUS_PENDING: "⏳", STATUS_INCOMPLETE: "⏳", STATUS_UNCONFIRMED: "❔"}
         entries = []
         for r in rows:
             status = r.get("review_status", "")

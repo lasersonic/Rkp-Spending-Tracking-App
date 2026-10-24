@@ -1,53 +1,62 @@
 # Restaurant Expense Tracker (LINE bot)
 
 Send a supplier receipt (photo or PDF) to the restaurant's LINE Official
-Account. The bot saves the original in Google Drive, asks which supplier it
-is and how much it was, categorizes the spend from the supplier, logs it to
-Google Sheets and replies in LINE:
+Account. The bot saves the original in Google Drive, reads the supplier and
+price with Google Cloud Vision for you to confirm (or you type them), takes
+the category from the supplier, logs it to Google Sheets and replies in LINE:
 
 ```
-📁 Saved to Drive (R261023-a1b2c3).
-Which supplier? Pick one, or tap ✏️ to type the name.
-   [ร้านผักสมบัติโน๊ต] [หมูอนามัย BETAGRO] … [✏️ Type name]
-→ tap a supplier
-Supplier: ร้านหมูอนามัย BETAGRO
-Type the total price for ร้านหมูอนามัย BETAGRO, e.g. 1250.
-→ type 1250
-Saved: ฿1,250 · ร้านหมูอนามัย BETAGRO · Food cost · 23/10 ✅
+📁 Saved (R261024-a1b2c3).
+I read: ฿100 · ร้านหมูอนามัย BETAGRO · 17/10
+Is this right?                      [✅ Confirm] [✏️ Enter manually]
+→ Confirm
+Saved: ฿100 · ร้านหมูอนามัย BETAGRO · Food cost · 17/10 ✅
    [Change price] [Change category] [Change supplier]
 ```
 
-There is no OCR in this flow: people type the supplier and price, so nothing
-is misread and nothing costs money. Only the one-time Telegram backfill reads
-receipts with Google Cloud Vision (free for 1,000 pages a month), because no
-one is there to answer questions for hundreds of old photos.
+**Enter manually** (or a photo Vision can't read at all) asks instead:
 
-Spec: v1.0, 17 Oct 2026. Cost: free (Cloud Run stays in its free tier).
+```
+Which supplier? Pick one, or tap ✏️ to type the name.
+   [ร้านผักสมบัติโน๊ต] [หมูอนามัย BETAGRO] … [✏️ Type name]
+→ tap a supplier
+Type the total price for ร้านหมูอนามัย BETAGRO, e.g. 1250.
+→ type 1250
+Saved: ฿1,250 · ร้านหมูอนามัย BETAGRO · Food cost · 24/10 ✅
+```
+
+When Vision reads only one of the two (handwritten bills usually give a price
+but no supplier), **Confirm** keeps that one and asks only for the other.
+
+Spec: v1.0, 17 Oct 2026. Cost: free (Vision reads 1,000 pages a month free;
+Cloud Run stays in its free tier).
 
 ## How it works
 
 ```
 LINE ──send──▶ LINE OA ──webhook──▶ Cloud Run (FastAPI)
                                       │
-   download ─▶ dedupe (SHA-256) ─▶ Drive /Receipts/YYYY/MM/ ─▶ Sheets row (incomplete)
-   ─▶ ask supplier (Suppliers tab chips or typed) ─▶ category from vendor memory
-   ─▶ ask price ─▶ Sheets row (ok) ─▶ rename in Drive ─▶ result + buttons
+   download ─▶ dedupe (SHA-256) ─▶ Drive /Receipts/YYYY/MM/ ─▶ Vision OCR
+   ─▶ match supplier (Vendors memory, Suppliers tab) ─▶ Sheets row (unconfirmed)
+   ─▶ "I read …" [Confirm] [Enter manually]
+   ─▶ ask what's missing (supplier chips or typed, price) ─▶ Sheets row (ok)
+   ─▶ rename in Drive ─▶ result + buttons
 ```
 
-The backfill (`scripts/backfill.py`) instead runs:
+The backfill (`scripts/backfill.py`) has no one to confirm, so it runs:
 download ─▶ dedupe ─▶ Drive ─▶ Vision OCR ─▶ validate ─▶ dedupe (vendor + invoice no.)
 ─▶ categorize ─▶ rename in Drive ─▶ Sheets rows.
 
 | File | What it does |
 |---|---|
 | `app/main.py` | `POST /callback`: checks the LINE signature, returns 200, processes in the background |
-| `app/pipeline.py` | The flow above, the questions and buttons, `daily`, `summary`, `help`; the OCR flow for the backfill |
-| `app/vision.py` | Vision OCR call with retries and the rule-based receipt parser (backfill only) |
+| `app/pipeline.py` | The flow above, the questions and buttons, `daily`, `summary`, `help`; the backfill's OCR flow |
+| `app/vision.py` | Vision OCR call with retries and the rule-based receipt parser |
 | `app/normalize.py` | Thai dates/amounts, the validation rules |
 | `app/categorize.py` | Categories and vendor matching (tax ID, then name/aliases) |
 | `app/storage.py` | Sheets tabs and Drive archive |
 | `app/dashboard.py` | Dashboard tab formulas |
-| `scripts/try_ocr.py` | Run receipts through Vision (to check the backfill's OCR) |
+| `scripts/try_ocr.py` | Run receipts through Vision and show what it reads |
 | `scripts/setup.py` | M1: Drive token, Drive folder, Sheet tabs |
 | `scripts/check_setup.py` | Pre-flight check of every integration |
 | `scripts/backfill.py` | M4: import the Telegram archive |
@@ -56,7 +65,9 @@ download ─▶ dedupe ─▶ Drive ─▶ Vision OCR ─▶ validate ─▶ ded
 
 | You do | Bot does |
 |---|---|
-| Send/forward a photo or PDF | Saves it to Drive, logs a row and asks **which supplier** |
+| Send/forward a photo or PDF | Saves it to Drive, reads it and shows **I read: price · supplier · date** |
+| **✅ Confirm** | Keeps what was read; asks only for what's missing, then shows the result |
+| **✏️ Enter manually** | Drops what was read and asks **which supplier**, then **the price** |
 | Tap a supplier, or **✏️ Type name** and type it | Saves the supplier (and its remembered category), then asks **the price** |
 | Type the price (e.g. `1250`, `฿1,250.50`, `๑๒๕๐ บาท`) | Saves it and shows the result with **Change price**, **Change category**, **Change supplier** |
 | **Change price** | Asks for the correct total; your next message replaces it |
@@ -86,14 +97,19 @@ The **Suppliers** tab is a fixed list you maintain: one name per row in the
 it are remembered on the **Vendors** tab, the bot's own memory of categories,
 tax IDs and alternative spellings; add them to Suppliers to get a chip.
 
-`review_status` values: `ok`, `incomplete` (supplier or price not given yet),
-`needs_review` (backfill: a check failed; see `review_note`), `pending_ocr`
+`review_status` values: `ok`, `unconfirmed` (read by OCR, not confirmed yet),
+`incomplete` (supplier or price not given yet), `needs_review` (a check failed,
+e.g. the same invoice was logged before; see `review_note`), `pending_ocr`
 (backfill: OCR failed); `flagged` and `confirmed` can be typed in by hand.
+
+The receipt date comes from the OCR when it's plausible (not in the future,
+under a year old), otherwise it's the day the photo was sent. **Enter
+manually** always uses the day it was sent.
 
 ## Setup
 
-### M0: backfill OCR test (optional)
-Only needed before the Telegram backfill. Vision only returns text and word positions; `app/vision.py` finds the fields
+### M0: OCR test (optional)
+Vision only returns text and word positions; `app/vision.py` finds the fields
 itself (labels such as "Grand Total"/"รวมทั้งหมด", tax IDs with a valid checksum,
 dates, table rows). To see what it makes of your receipts:
 ```bash
@@ -115,7 +131,7 @@ Change price / Change supplier buttons. HEIC files are archived but not read
    *Channel access token*.
 2. **Google Cloud**: create a project; enable Cloud Run, Sheets, Drive and
    Secret Manager APIs; create a service account and download its JSON key.
-   For the Telegram backfill only, also enable the **Cloud Vision** API (it
+   Also enable the **Cloud Vision** API (it
    needs billing on even while it stays free; add a budget alert to be safe).
    The same key is used for Vision.
 3. **Sheet**: create an empty Google Sheet and share it (Editor) with the
