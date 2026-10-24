@@ -6,15 +6,13 @@ price with Google Cloud Vision for you to confirm (or you type them), takes
 the category from the supplier, logs it to Google Sheets and replies in LINE:
 
 ```
-📁 Saved (R261024-a1b2c3).
-I read: ฿100 · ร้านหมูอนามัย BETAGRO · 17/10
-Is this right?                      [✅ Confirm] [✏️ Enter manually]
-→ Confirm
 Saved: ฿100 · ร้านหมูอนามัย BETAGRO · Food cost · 17/10 ✅
-   [Change price] [Change category] [Change supplier]
+   [Change price] [Change category] [Change supplier] [✏️ Enter manually]
 ```
 
-**Enter manually** (or a photo Vision can't read at all) asks instead:
+What Vision reads is saved straight away; no confirmation is needed. If it's
+wrong, tap a Change button, or **Enter manually** to type it all again.
+**Enter manually** (or a photo Vision can't read at all) asks:
 
 ```
 Which supplier? Pick one, or tap ✏️ to type the name.
@@ -26,7 +24,7 @@ Saved: ฿1,250 · ร้านหมูอนามัย BETAGRO · Food cost 
 ```
 
 When Vision reads only one of the two (handwritten bills usually give a price
-but no supplier), **Confirm** keeps that one and asks only for the other.
+but no supplier), the bot saves that one and asks only for the other.
 
 Spec: v1.0, 17 Oct 2026. Cost: free (Vision reads 1,000 pages a month free;
 Cloud Run stays in its free tier).
@@ -37,9 +35,8 @@ Cloud Run stays in its free tier).
 LINE ──send──▶ LINE OA ──webhook──▶ Cloud Run (FastAPI)
                                       │
    download ─▶ dedupe (SHA-256) ─▶ Drive /Receipts/YYYY/MM/ ─▶ Vision OCR
-   ─▶ match supplier (Vendors memory, Suppliers tab) ─▶ Sheets row (unconfirmed)
-   ─▶ "I read …" [Confirm] [Enter manually]
-   ─▶ ask what's missing (supplier chips or typed, price) ─▶ Sheets row (ok)
+   ─▶ match supplier (Vendors memory, Suppliers tab) ─▶ Sheets row (ok)
+   ─▶ ask only what's missing (supplier chips or typed, price)
    ─▶ rename in Drive ─▶ result + buttons
 ```
 
@@ -65,8 +62,7 @@ download ─▶ dedupe ─▶ Drive ─▶ Vision OCR ─▶ validate ─▶ ded
 
 | You do | Bot does |
 |---|---|
-| Send/forward a photo or PDF | Saves it to Drive, reads it and shows **I read: price · supplier · date** |
-| **✅ Confirm** | Keeps what was read; asks only for what's missing, then shows the result |
+| Send/forward a photo or PDF | Saves it to Drive, reads it, saves what it read and shows the result; asks only for what it couldn't read |
 | **✏️ Enter manually** | Drops what was read and asks **which supplier**, then **the price** |
 | Tap a supplier, or **✏️ Type name** and type it | Saves the supplier (and its remembered category), then asks **the price** |
 | Type the price (e.g. `1250`, `฿1,250.50`, `๑๒๕๐ บาท`) | Saves it and shows the result with **Change price**, **Change category**, **Change supplier** |
@@ -97,7 +93,7 @@ The **Suppliers** tab is a fixed list you maintain: one name per row in the
 it are remembered on the **Vendors** tab, the bot's own memory of categories,
 tax IDs and alternative spellings; add them to Suppliers to get a chip.
 
-`review_status` values: `ok`, `unconfirmed` (read by OCR, not confirmed yet),
+`review_status` values: `ok`, `unconfirmed` (read by OCR but not saved; only after a crash),
 `incomplete` (supplier or price not given yet), `needs_review` (a check failed,
 e.g. the same invoice was logged before; see `review_note`), `pending_ocr`
 (backfill: OCR failed); `flagged` and `confirmed` can be typed in by hand.

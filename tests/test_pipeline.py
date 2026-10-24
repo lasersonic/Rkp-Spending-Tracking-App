@@ -533,44 +533,33 @@ def test_ocr_misread_supplier_is_fixed_and_learned():
     assert bot.sheets.rows[1]["category"] == "FOOD"
 
 
-# -- LINE with Vision: read, then Confirm or Enter manually ---------------------------
+# -- LINE with Vision: saved as read; change it or enter it manually -----------------
 
 MAKRO = "บริษัท สยามแม็คโคร จำกัด (มหาชน)"
 
 
 def vision_bot(ocr=None, **kw):
-    """The deployed bot: reads the photo with OCR and asks the sender to confirm."""
+    """The deployed bot: reads the photo with OCR and saves what it read."""
     return shop_bot(ocr=ocr or FakeOcr(receipt()), **kw)
 
 
-def test_photo_is_read_and_shown_for_confirmation():
+def test_photo_is_read_and_saved_without_confirming():
     bot, line = vision_bot()
     bot.handle(image_event())
     [row] = bot.sheets.rows
-    rid = row["receipt_id"]
     assert bot.ocr.calls == 1
-    assert row["review_status"] == "unconfirmed" and row["review_note"] == "read by OCR, not confirmed yet"
     assert (row["vendor_name"], row["grand_total"], row["receipt_date"]) == (MAKRO, "1,240.00", "2026-10-15")
-    msg = last_reply(line)
-    assert msg.text == f"📁 Saved ({rid}).\nI read: ฿1,240 · {MAKRO} · 15/10\nIs this right?"
-    assert len(msg.text) <= 160  # LINE's limit for a buttons message
-    assert labels(msg, quick=False) == ["✅ Confirm", "✏️ Enter manually"]
-
-
-def test_confirm_saves_the_reading_then_asks_a_category_for_a_new_supplier():
-    bot, line = vision_bot()
-    bot.handle(image_event())
-    tap(bot, line, "✅ Confirm")
-    row = bot.sheets.rows[0]
     assert row["review_status"] == "ok" and row["review_note"] == ""
     msg = last_reply(line)
     assert msg.text == f"Saved: ฿1,240 · {MAKRO} · ❓ category · 15/10\nNew supplier: pick a category below."
-    assert labels(msg, quick=False) == ["Change price", "Change category", "Change supplier"]
-    tap(bot, line, "Food cost")
-    assert last_reply(line).text == f"Saved: ฿1,240 · {MAKRO} · Food cost · 15/10 ✅"
+    assert len(msg.text) <= 160  # LINE's limit for a buttons message
+    assert labels(msg, quick=False) == ["Change price", "Change category", "Change supplier", "✏️ Enter manually"]
+    assert "Food cost" in labels(msg)
     [f] = bot.drive.files.values()
     assert f["name"] == "2026-10-15_บริษัท-สยามแม็คโคร-จำกัด-(มหาชน)_1240.00.jpg"
 
+    tap(bot, line, "Food cost")
+    assert last_reply(line).text == f"Saved: ฿1,240 · {MAKRO} · Food cost · 15/10 ✅"
     tap(bot, line, "Change price")  # the usual revise buttons work afterwards
     bot.handle(text_event("1300"))
     assert bot.sheets.rows[0]["grand_total"] == "1,300.00"
@@ -581,8 +570,6 @@ def test_known_supplier_is_recognised_with_its_category():
     bot.sheets.save_vendor(Vendor(vendor_key("", BETAGRO), "", BETAGRO, aliases=["ร้านหมูอนามัย BETAGR0"],
                                   category="FOOD"))
     bot.handle(image_event())
-    assert f"I read: ฿1,240 · {BETAGRO} · 15/10" in last_reply(line).text
-    tap(bot, line, "✅ Confirm")
     assert last_reply(line).text == f"Saved: ฿1,240 · {BETAGRO} · Food cost · 15/10 ✅"
     assert bot.sheets.rows[0]["category"] == "FOOD"
     assert next(v for v in bot.sheets.vendors() if v.name == BETAGRO).receipt_count == 1
@@ -591,7 +578,7 @@ def test_known_supplier_is_recognised_with_its_category():
 def test_name_on_the_suppliers_tab_is_used_as_written_there():
     bot, line = vision_bot(ocr=FakeOcr(receipt(vendor_name="ร้านไข่ นายร้อย", vendor_tax_id="")))
     bot.handle(image_event())
-    assert "I read: ฿1,240 · ร้านไข่นายร้อย ·" in last_reply(line).text
+    assert last_reply(line).text.startswith("Saved: ฿1,240 · ร้านไข่นายร้อย ·")
 
 
 def test_enter_manually_drops_the_reading_and_follows_the_typed_flow():
@@ -612,9 +599,9 @@ def test_enter_manually_drops_the_reading_and_follows_the_typed_flow():
 def test_price_read_but_no_supplier_asks_only_the_supplier():
     bot, line = vision_bot(ocr=FakeOcr(receipt(vendor_name="", vendor_tax_id="", grand_total="180")))
     bot.handle(image_event())
-    assert "I read: ฿180 · supplier ? ·" in last_reply(line).text
-    tap(bot, line, "✅ Confirm")
-    assert last_reply(line).text.startswith("Price ฿180 saved.\nWhich supplier?")
+    rid = bot.sheets.rows[0]["receipt_id"]
+    assert last_reply(line).text.startswith(f"📁 Saved ({rid}).\nI read ฿180 but not the supplier.\nWhich supplier?")
+    assert bot.sheets.rows[0]["review_status"] == "incomplete"
     bot.handle(text_event("ร้านป้าแดง"))  # 1:1 chat: typing works straight away
     row = bot.sheets.rows[0]
     assert row["vendor_name"] == "ร้านป้าแดง" and row["grand_total"] == "180.00" and row["review_status"] == "ok"
@@ -624,9 +611,9 @@ def test_price_read_but_no_supplier_asks_only_the_supplier():
 def test_supplier_read_but_no_price_asks_only_the_price():
     bot, line = vision_bot(ocr=FakeOcr(receipt(grand_total="", vat="")))
     bot.handle(image_event())
-    assert f"I read: price ? · {MAKRO} ·" in last_reply(line).text
-    tap(bot, line, "✅ Confirm")
-    assert last_reply(line).text.startswith(f"Supplier: {MAKRO}\nType the total price")
+    rid = bot.sheets.rows[0]["receipt_id"]
+    assert last_reply(line).text.startswith(
+        f"📁 Saved ({rid}).\nI couldn't read the price.\nSupplier: {MAKRO}\nType the total price")
     bot.handle(text_event("99"))
     assert bot.sheets.rows[0]["grand_total"] == "99.00" and bot.sheets.rows[0]["review_status"] == "ok"
 
@@ -665,31 +652,21 @@ def test_unlikely_dates_fall_back_to_the_day_it_was_sent():
     assert bot.sheets.rows[0]["receipt_date"] == "2026-10-17" and "· 17/10" in last_reply(line).text
 
 
-def test_same_invoice_is_flagged_and_stays_for_review():
+def test_same_invoice_is_flagged_and_left_for_review():
     bot, line = vision_bot()
     bot.handle(image_event())
-    tap(bot, line, "✅ Confirm")
     first = bot.sheets.rows[0]["receipt_id"]
     line.content = JPEG + b"another photo of the same bill"
     bot.handle(image_event(msg_id="m2"))
-    assert f"⚠️ Same invoice as {first}?" in last_reply(line).text
-    tap(bot, line, "✅ Confirm")
+    assert last_reply(line).text.endswith(f"\n⚠️ Same invoice as {first}?")
     row = bot.sheets.rows[1]
     assert row["review_status"] == "needs_review" and row["review_note"] == f"possible duplicate of {first}"
 
 
-def test_confirm_twice_just_shows_the_result():
+def test_old_confirm_buttons_still_work():
     bot, line = vision_bot()
     bot.handle(image_event())
-    confirm = button_data(last_reply(line), "✅ Confirm")
-    bot.handle(postback_event(confirm))
-    bot.handle(postback_event(confirm))
+    rid = bot.sheets.rows[0]["receipt_id"]
+    bot.handle(postback_event(f"a=conf&r={rid}"))  # already saved: just shows it
     assert last_reply(line).text.startswith(f"Saved: ฿1,240 · {MAKRO}")
     assert next(v for v in bot.sheets.vendors() if v.name == MAKRO).receipt_count == 1
-
-
-def test_daily_marks_unconfirmed_readings():
-    bot, line = vision_bot()
-    bot.handle(image_event())
-    bot.handle(text_event("daily"))
-    assert f"• ฿1,240 · {MAKRO} · ❓ category ❔" in last_reply(line).text.splitlines()

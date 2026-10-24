@@ -22,7 +22,7 @@ import logging
 import re
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Any, Callable
@@ -69,7 +69,7 @@ STATUS_PENDING = "pending_ocr"
 STATUS_FLAGGED = "flagged"
 STATUS_CONFIRMED = "confirmed"
 STATUS_INCOMPLETE = "incomplete"  # archived; supplier or price not given yet
-STATUS_UNCONFIRMED = "unconfirmed"  # read by OCR; the sender hasn't confirmed it yet
+STATUS_UNCONFIRMED = "unconfirmed"  # read by OCR, not saved yet (only for a moment, or after a crash)
 
 ASK_SUPPLIER, TYPE_SUPPLIER, ASK_PRICE = "supplier", "supplier_text", "price"
 
@@ -142,10 +142,11 @@ def vendor_label(name: str) -> str:
 
 @dataclass
 class Outcome:
-    status: str  # logged | duplicate | pending | rejected | error
+    status: str  # logged | read | waiting | duplicate | pending | rejected | error
     message: OutMessage
     receipt_id: str = ""
     needs_category: bool = False
+    record: dict[str, Any] | None = None
 
 
 @dataclass
@@ -256,6 +257,8 @@ class Bot:
         outcome = self.process_file(content, filename, submitted_by=user_id, source="line", interactive=True)
         if outcome.status == "waiting":
             self._wait(user_id, to, outcome.receipt_id, ASK_SUPPLIER)
+        if outcome.status == "read":
+            return self.save_reading(outcome.record, user_id, to, intro=f"📁 Saved ({outcome.receipt_id}).")
         return outcome.message
 
     def handle_text(self, text: str, user_id: str = "", to: str = "") -> OutMessage | None:
@@ -413,8 +416,8 @@ class Bot:
             return OutMessage('Type the supplier name.\nSend "cancel" to stop.')
         if action == "ven":
             return self.set_vendor(receipt, q.get("v", ""), user_id, to)
-        if action == "conf":
-            return self.confirm_reading(receipt, user_id, to)
+        if action == "conf":  # from the earlier "Is this right?" messages
+            return self.save_reading(receipt, user_id, to)
         if action == "manual":
             return self.enter_manually(receipt, user_id, to)
         if action == "price":
@@ -611,7 +614,7 @@ class Bot:
         else:
             received = received_at.date()
             plausible = r.receipt_date and timedelta(0) <= received - r.receipt_date <= timedelta(days=366)
-            note = ["read by OCR, not confirmed yet"]
+            note = ["read by OCR"]
             dup = self.sheets.invoice_exists(name, r.invoice_no) if name and r.invoice_no else None
             if dup:
                 note.append(f"possible duplicate of {dup}")
@@ -628,7 +631,8 @@ class Bot:
                 review_status=STATUS_UNCONFIRMED,
                 review_note="; ".join(note),
             )
-            outcome = Outcome("confirm", self.confirm_message(record, dup), receipt_id)
+            # Saved as read straight away; save_reading asks for anything missing.
+            outcome = Outcome("read", OutMessage(""), receipt_id, record=record)
         try:
             self.sheets.add_receipt(record, [])
         except Exception as exc:
@@ -654,34 +658,23 @@ class Bot:
                     return name, ""
         return r.vendor_name, ""
 
-    def confirm_message(self, record: dict[str, Any], duplicate_of: str | None = None) -> OutMessage:
-        rid = record["receipt_id"]
-        d = record.get("receipt_date")
-        parts = [
-            fmt_baht(record.get("grand_total")) if record.get("grand_total") is not None else "price ?",
-            record.get("vendor_name") or "supplier ?",
-            f"{d:%d/%m}" if d else "no date",
-        ]
-        text = f"📁 Saved ({rid}).\nI read: " + " · ".join(parts)
-        if duplicate_of:
-            text += f"\n⚠️ Same invoice as {duplicate_of}?"
-        text += "\nIs this right?"
-        return OutMessage(text, buttons=(
-            Button("✅ Confirm", postback("conf", rid)),
-            Button("✏️ Enter manually", postback("manual", rid)),
-        ))
-
-    def confirm_reading(self, receipt: dict[str, str], user_id: str, to: str) -> OutMessage:
-        """"Confirm": keep what the OCR read, then ask only for what it missed."""
+    def save_reading(self, receipt: dict[str, Any], user_id: str, to: str, intro: str = "") -> OutMessage:
+        """Keep what the OCR read (no confirmation needed) and ask only for what it missed.
+        The result carries "Enter manually" too, for when the reading is wrong."""
         rid = receipt["receipt_id"]
         if receipt.get("review_status") != STATUS_UNCONFIRMED:
-            return self.result_message(receipt)  # tapped twice
-        if receipt.get("vendor_name"):
-            return self.set_vendor_name(receipt, receipt["vendor_name"], user_id, to)
-        fields = {"review_status": STATUS_INCOMPLETE, "review_note": "waiting for supplier"}
-        self.sheets.update_receipt(rid, fields)
-        self._wait(user_id, to, rid, ASK_SUPPLIER)
-        return self.ask_supplier(rid, f"Price {fmt_baht(parse_amount(receipt.get('grand_total')))} saved.")
+            return self.result_message(receipt)  # an old "Confirm" button tapped again
+        total = parse_amount(receipt.get("grand_total"))
+        if not receipt.get("vendor_name"):
+            self.sheets.update_receipt(rid, {"review_status": STATUS_INCOMPLETE, "review_note": "waiting for supplier"})
+            self._wait(user_id, to, rid, ASK_SUPPLIER)
+            return self.ask_supplier(rid, f"{intro}\nI read {fmt_baht(total)} but not the supplier.".strip())
+        msg = self.set_vendor_name(receipt, receipt["vendor_name"], user_id, to)
+        if total is None:
+            return replace(msg, text=f"{intro}\nI couldn't read the price.\n{msg.text}".strip())
+        dup = next((p for p in str(receipt.get("review_note", "")).split("; ") if p.startswith("possible duplicate of ")), "")
+        text = msg.text + (f"\n⚠️ Same invoice as {dup.rsplit(' ', 1)[-1]}?" if dup else "")
+        return replace(msg, text=text, buttons=msg.buttons + (Button("✏️ Enter manually", postback("manual", rid)),))
 
     def enter_manually(self, receipt: dict[str, str], user_id: str, to: str) -> OutMessage:
         """"Enter manually": drop what the OCR read and ask for supplier, then price."""
